@@ -1,0 +1,10 @@
+# Bỏ qua môi trường ảo
+venv/
+__pycache__/
+
+# Bỏ qua thư mục chứa dữ liệu (dataset)
+data/
+
+# Bỏ qua các file cấu hình môi trường cá nhân
+.env
+.ipynb_checkpoints/
