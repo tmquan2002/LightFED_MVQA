@@ -69,4 +69,4 @@ if __name__ == "__main__":
         non_iid_clients = splitter.split_non_iid_by_quantity()
         
     except FileNotFoundError:
-        print("Data not found. Please run file data_subset_generator.py first.")
+        print("Data not found, please run file data_subset_generator.py first")

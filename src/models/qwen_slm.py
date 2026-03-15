@@ -5,7 +5,16 @@ import io
 from PIL import Image
 
 class QwenMedVQA:
+    """
+    A wrapper class for the Qwen2-VL Small Language Model (SLM) tailored for 
+    Medical Visual Question Answering (Med-VQA). It handles model initialization 
+    (with optional 4-bit quantization for memory efficiency), image preprocessing, 
+    and text generation while preventing memory leaks during inference.
+    """
     def __init__(self, model_id="Qwen/Qwen2-VL-2B-Instruct", use_4bit=True):
+        """
+        Initializes the Qwen2-VL model and its corresponding processor.
+        """
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
         quantization_config = None
@@ -26,6 +35,10 @@ class QwenMedVQA:
         self.processor = AutoProcessor.from_pretrained(model_id)
 
     def _preprocess_image(self, image):
+        """
+        Standardizes the input image format to an RGB PIL Image.
+        Handles raw bytes dictionaries (from Hugging Face datasets) and file paths.
+        """
         if isinstance(image, dict) and 'bytes' in image:
             return Image.open(io.BytesIO(image['bytes'])).convert("RGB")
         elif isinstance(image, str):
@@ -33,6 +46,9 @@ class QwenMedVQA:
         return image
 
     def predict(self, image, question):
+        """
+        Generates an answer for a given medical image and question.
+        """
         img_obj = self._preprocess_image(image)
         
         messages = [
@@ -58,6 +74,7 @@ class QwenMedVQA:
             return_tensors="pt",
         ).to(self.device)
 
+        # Prevents memory leak during inference loop   
         with torch.no_grad():
             generated_ids = self.model.generate(**inputs, max_new_tokens=50)
             
