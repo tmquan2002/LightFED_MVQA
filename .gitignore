@@ -1,10 +1,10 @@
-# Bỏ qua môi trường ảo
+# Ignore the virtual environment
 venv/
 __pycache__/
 
-# Bỏ qua thư mục chứa dữ liệu (dataset)
+# Ignore data folder
 data/
 
-# Bỏ qua các file cấu hình môi trường cá nhân
+# Ignore personal keys
 .env
 .ipynb_checkpoints/
