@@ -26,19 +26,44 @@ def create_subset(dataset_name, num_samples=50, save_path=None):
         
     return subset_dict
 
+def load_full_datasets(dataset_name, save_path=None):
+    full_dataset = load_dataset(dataset_name)
+    subset_train = full_dataset['train']
+
+    subset_dict = DatasetDict({'train': subset_train})
+
+    if save_path:
+        os.makedirs(save_path, exist_ok=True)
+        subset_dict.save_to_disk(save_path)
+        print(f"[Loader] Saved {dataset_name} at: {save_path}\n")
+        
+    return subset_dict
+
 if __name__ == "__main__":
     print("--- Create Subset ---")
     
-    # Create subset for VQA-RAD
-    create_subset(
+    # # Create subset for VQA-RAD
+    # create_subset(
+    #     dataset_name="flaviagiammarino/vqa-rad", 
+    #     num_samples=50, 
+    #     save_path="./data/vqa_rad_subset_50"
+    # )
+    
+    # # Create subset for PathVQA
+    # create_subset(
+    #     dataset_name="flaviagiammarino/path-vqa", 
+    #     num_samples=100, 
+    #     save_path="./data/path_vqa_subset_100"
+    # )
+
+    # Create subset all for VQA-RAD
+    load_full_datasets(
         dataset_name="flaviagiammarino/vqa-rad", 
-        num_samples=50, 
         save_path="./data/vqa_rad_subset_50"
     )
     
-    # Create subset for PathVQA
-    create_subset(
-        dataset_name="flaviagiammarino/path-vqa", 
-        num_samples=100, 
+    # Create subset all for PathVQA
+    load_full_datasets(
+        dataset_name="flaviagiammarino/path-vqa",
         save_path="./data/path_vqa_subset_100"
     )
