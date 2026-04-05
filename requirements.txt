@@ -2,3 +2,16 @@ datasets
 pillow
 matplotlib
 jupyter
+torch
+torchvision
+torchaudio
+transformers
+peft
+accelerate
+bitsandbytes
+faiss-cpu
+numpy
+tqdm
+wandb
+qwen-vl-utils
+av

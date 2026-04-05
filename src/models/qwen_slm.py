@@ -76,7 +76,15 @@ class QwenMedVQA:
 
         # Prevents memory leak during inference loop   
         with torch.no_grad():
-            generated_ids = self.model.generate(**inputs, max_new_tokens=50)
+            generated_ids = self.model.generate(
+                **inputs, 
+                max_new_tokens=50,
+                do_sample=False,        
+                num_beams=3,            
+                early_stopping=True,
+                pad_token_id=self.processor.tokenizer.pad_token_id,
+                eos_token_id=self.processor.tokenizer.eos_token_id
+            )
             
         generated_ids_trimmed = [
             out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
