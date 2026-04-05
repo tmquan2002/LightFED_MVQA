@@ -59,11 +59,11 @@ if __name__ == "__main__":
     # Create subset all for VQA-RAD
     load_full_datasets(
         dataset_name="flaviagiammarino/vqa-rad", 
-        save_path="./data/vqa_rad_subset_50"
+        save_path="./data/vqa_rad_subset_full"
     )
     
     # Create subset all for PathVQA
     load_full_datasets(
         dataset_name="flaviagiammarino/path-vqa",
-        save_path="./data/path_vqa_subset_100"
+        save_path="./data/path_vqa_subset_full"
     )

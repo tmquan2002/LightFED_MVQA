@@ -15,3 +15,4 @@ tqdm
 wandb
 qwen-vl-utils
 av
+scikit-learn

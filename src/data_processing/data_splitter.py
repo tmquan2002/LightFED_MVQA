@@ -6,67 +6,64 @@ class FederatedDataSplitter:
     A utility class designed to partition a centralized dataset into multiple 
     smaller subsets for simulated Federated Learning (FL) clients.
     """
-    def __init__(self, dataset: Dataset, num_clients: int = 5):
-        """
-        Initializes the Federated Data Splitter.
-        """
+    def __init__(self, dataset: Dataset, num_clients: int = 2):
         self.dataset = dataset
         self.num_clients = num_clients
-        self.total_samples = len(dataset)
         
     def split_iid(self):
         """
         Performs Independent and Identically Distributed (IID) data splitting.
         """
-        print(f"[Splitter] Assigning IIDs to {self.num_clients} Clients...")
-        indices = np.random.permutation(self.total_samples)
-        split_indices = np.array_split(indices, self.num_clients)
+        shuffled_dataset = self.dataset.shuffle(seed=42)
+        split_size = len(shuffled_dataset) // self.num_clients
         
         client_datasets = []
-        for i, idx_array in enumerate(split_indices):
-            client_subset = self.dataset.select(idx_array.tolist())
-            client_datasets.append(client_subset)
-            print(f"  -> Client {i+1} nhận {len(client_subset)} mẫu.")
+        for i in range(self.num_clients):
+            start_idx = i * split_size
+            end_idx = len(shuffled_dataset) if i == self.num_clients - 1 else (i + 1) * split_size
+            subset = shuffled_dataset.select(range(start_idx, end_idx))
+            client_datasets.append(subset)
             
         return client_datasets
 
-    def split_non_iid_by_quantity(self, min_size=0.05, max_size=0.4):
+    def split_non_iid(self, alpha: float = 0.5, seed: int = 42):
         """
-        Performs Non-IID (Non-Independent and Identically Distributed) data splitting 
+        Performs Non-IID data splitting 
         using Dirichlet distribution.
         """
-        print(f"[Splitter] Allocating Non-IID (Quantity Difference) to {self.num_clients} Clients...")
-        indices = np.random.permutation(self.total_samples)
-        proportions = np.random.uniform(min_size, max_size, self.num_clients)
-        proportions = proportions / proportions.sum() 
-        sample_counts = (proportions * self.total_samples).astype(int)
-        sample_counts[-1] = self.total_samples - sample_counts[:-1].sum()
+        np.random.seed(seed)
         
-        client_datasets = []
-        current_idx = 0
-        for i, count in enumerate(sample_counts):
-            idx_array = indices[current_idx : current_idx + count]
-            client_subset = self.dataset.select(idx_array.tolist())
-            client_datasets.append(client_subset)
-            current_idx += count
+        num_classes = 5
+        answers = [str(ans).lower().strip() for ans in self.dataset['answer']]
+        classes = np.array([hash(ans) % num_classes for ans in answers])
+        class_indices = {c: np.where(classes == c)[0] for c in range(num_classes)}
+        client_indices = [[] for _ in range(self.num_clients)]
+        
+        for c in range(num_classes):
+            idx = class_indices[c]
+            np.random.shuffle(idx)
             
-            print(f" Hospital (Client {i+1}) size {'Large' if count > self.total_samples/self.num_clients else 'Small'} receives {count} samples ({proportions[i]*100:.1f}%).")
+            if len(idx) == 0:
+                continue
+                
+            proportions = np.random.dirichlet(np.repeat(alpha, self.num_clients))
+            proportions = proportions / proportions.sum()
+            split_points = (np.cumsum(proportions) * len(idx)).astype(int)[:-1]
+            
+            idx_splits = np.split(idx, split_points)
+            for i in range(self.num_clients):
+                client_indices[i].extend(idx_splits[i].tolist())
+                
+        client_datasets = []
+        for indices in client_indices:
+            np.random.shuffle(indices)
+            if len(indices) == 0:
+                indices = [np.random.randint(0, len(self.dataset))]
+                
+            client_datasets.append(self.dataset.select(indices))
+            
+        print(f"[DataSplitter] Non-IID splitted (alpha={alpha}).")
+        for i, ds in enumerate(client_datasets):
+            print(f"Hospital {i+1} receives: {len(ds)} ảnh.")
             
         return client_datasets
-
-# Testing module
-if __name__ == "__main__":
-    from datasets import load_from_disk
-    
-    try:
-        # Load VQA-RAD subset
-        dataset = load_from_disk("../../data/vqa_rad_subset_50")['train']
-        splitter = FederatedDataSplitter(dataset, num_clients=3)
-        print("--- Test IID ---")
-        iid_clients = splitter.split_iid()
-        
-        print("\n--- Test NON-IID ---")
-        non_iid_clients = splitter.split_non_iid_by_quantity()
-        
-    except FileNotFoundError:
-        print("Data not found, please run file data_subset_generator.py first")
