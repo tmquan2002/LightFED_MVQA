@@ -3,7 +3,7 @@ from src.rag_system.vector_db import MedicalRetriever
 
 class MedVQARAGPipeline:
     """
-    Hệ thống RAG hoàn chỉnh: Kết hợp tìm kiếm vector (FAISS) và sinh văn bản (Qwen2-VL).
+    Completed RAG system
     """
     def __init__(self, use_4bit=True):
         print("[RAG-Pipeline] Initilize MED-VQA RAG Retriver")
@@ -31,7 +31,6 @@ class MedVQARAGPipeline:
         # Add context to actual question
         augmented_question = f"{context_text}\nNow, please answer this new Question: {question}"
         
-        # In ra màn hình để bạn dễ theo dõi (khi debug)
         print("\n[RAG-Pipeline] RAG Prompt created, add to SLM")
         print(augmented_question)
         
@@ -53,7 +52,7 @@ if __name__ == "__main__":
         prediction = pipeline.predict(
             image=test_sample['image'], 
             question=test_sample['question'], 
-            top_k=2 # Lấy 2 ca giống nhất
+            top_k=2
         )
         
         print(f"Original question: {test_sample['question']}")
