@@ -59,14 +59,37 @@ This script automatically initializes the Shared-Engine architecture, builds the
 ```bash
 python main_federated.py
 ```
+You can then input different configs during run time
 
-### 2. Add LLaVA-Med (13B) Baseline
-Since the LLaVA-Med 13B model is extremely resource-intensive (>12GB VRAM), this project provides a separate script to append its simulated baseline metrics to the global results file.
+### 2. Baselines
+This project provided seperate scripts for comparison purpose
+- Calculate loss based on Epochs
 ```bash
-python run_llava_baseline.py
+python calculate_loss.py
 ```
+- Calculate performance based on number of retriver k
+```bash
+python main_federated_test_retriever_k.py
+```
+- Centralized setup
+```bash
+python main_federated_centralized.py
+```
+- No RAG setup
+```bash
+python main_federated_no_RAG.py
+```
+- LLM model setup
+```bash
+python main_federated_LLM.py
+```
+- Computational comparison
+```bash
+python computational_compare.py
+```
+
 ## Evaluation Metrics
-Upon completion, all results are securely saved at: ./data/evaluation_results.json. The system is evaluated across 4 standard medical metrics:
+Upon completion, all results are securely saved at: ./data folder. The system is evaluated across 4 standard medical metrics:
 
 - **Closed-ended questions (Yes/No):**
     - **Accuracy:** The absolute diagnostic correctness rate.
@@ -74,16 +97,16 @@ Upon completion, all results are securely saved at: ./data/evaluation_results.js
 - **Open-ended questions (Descriptive):**
     - **BLEU:** Lexical similarity against the doctor's ground truth.
     - **ROUGE-L:** Structural sentence similarity and longest common subsequence matching.
-
-
-
-
     
 ## Author
 
 - [Trần Minh Quân](https://github.com/tmquan2002): Writing and Coding
-- [Lê Quang Hưng](https://scholar.google.com/citations?hl=en&user=OivKl1gAAAAJ&view_op=list_works&sortby=pubdate): Instructor and Researcher
+- [Phạm Quang Vinh](https://github.com/vinh1988): Reviewer and Supporter
+- [Lê Quang Hùng](https://scholar.google.com/citations?hl=en&user=OivKl1gAAAAJ&view_op=list_works&sortby=pubdate): Instructor and Researcher
 
 
 ## License
 This project is licensed under the [MIT License](https://choosealicense.com/licenses/mit/). It is suitable for scientific research and academic development purposes.
+
+## Paper
+Under work in progress
