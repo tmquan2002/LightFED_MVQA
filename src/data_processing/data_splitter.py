@@ -6,16 +6,24 @@ class FederatedDataSplitter:
     A utility class designed to partition a centralized dataset into multiple 
     smaller subsets for simulated Federated Learning (FL) clients.
     """
-    def __init__(self, dataset: Dataset, num_clients: int = 2):
+    def __init__(self, dataset: Dataset, num_clients: int = 2, seed: int = None):
         self.dataset = dataset
         self.num_clients = num_clients
+        self.seed = seed
         
     def split_iid(self):
         """
         Performs Independent and Identically Distributed (IID) data splitting.
         """
-        shuffled_dataset = self.dataset.shuffle(seed=42)
+        import random
+        if self.seed is None:
+            shuffle_seed = random.randint(0, 1000000)
+        else:
+            shuffle_seed = self.seed
+        
+        shuffled_dataset = self.dataset.shuffle(seed=shuffle_seed)
         split_size = len(shuffled_dataset) // self.num_clients
+        print(f"[DataSplitter] IID split with seed {shuffle_seed}")
         
         client_datasets = []
         for i in range(self.num_clients):
@@ -26,12 +34,19 @@ class FederatedDataSplitter:
             
         return client_datasets
 
-    def split_non_iid(self, alpha: float = 0.5, seed: int = 42):
+    def split_non_iid(self, alpha: float = 0.5):
         """
         Performs Non-IID data splitting 
         using Dirichlet distribution.
         """
-        np.random.seed(seed)
+        import random
+        if self.seed is None:
+            dirichlet_seed = random.randint(0, 1000000)
+        else:
+            dirichlet_seed = self.seed
+            
+        np.random.seed(dirichlet_seed)
+        print(f"[DataSplitter] Non-IID split with seed {dirichlet_seed}")
         
         num_classes = 5
         answers = [str(ans).lower().strip() for ans in self.dataset['answer']]
@@ -64,6 +79,6 @@ class FederatedDataSplitter:
             
         print(f"[DataSplitter] Non-IID splitted (alpha={alpha}).")
         for i, ds in enumerate(client_datasets):
-            print(f"Hospital {i+1} receives: {len(ds)} ảnh.")
+            print(f"Hospital {i+1} receives: {len(ds)} photos.")
             
         return client_datasets

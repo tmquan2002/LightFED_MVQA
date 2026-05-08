@@ -73,7 +73,7 @@ class MedicalRetriever:
         self.index.add(embeddings_matrix)
         print(f"[RAG Vector] Done, FAISS currently have {self.index.ntotal} vector.")
 
-    def search_similar_cases(self, query_image, k=3):
+    def search_similar_cases(self, query_image, k=2):
         """
         Receive photos of new patients, find K cases with the most matching photos in the database.
         """
@@ -84,7 +84,7 @@ class MedicalRetriever:
         distances, indices = self.index.search(query_vector, k)
         results = []
         for idx, dist in zip(indices[0], distances[0]):
-            if idx != -1: # -1 nghĩa là không tìm thấy
+            if idx != -1:
                 info = self.metadata[idx]
                 info['distance'] = float(dist)
                 results.append(info)
@@ -97,7 +97,8 @@ if __name__ == "__main__":
     retriever = MedicalRetriever()
     
     try:
-        dataset = load_from_disk("../../data/vqa_rad_subset_50")['train']
+        dataset = load_from_disk("./data/vqa_rad_subset_50")['train']
+        print(f"[RAG Vector] Loaded {len(dataset)} samples")
         retriever.build_index_from_dataset(dataset)
         test_sample = dataset[-1]
         test_image = test_sample['image']
