@@ -9,7 +9,7 @@ from src.data_processing.data_splitter import FederatedDataSplitter
 from src.federated.server import FederatedServer
 from src.evaluation.metrics import MedVQAEvaluator
 from src.rag_system.vector_db import MedicalRetriever
-from src.models.llava_med import LLaVAMedVQA
+from src.models.qwen_slm import QwenMedVQA
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, get_peft_model_state_dict
 
 class VirtualClient:
@@ -109,8 +109,8 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     print(f"\nSTARTING EXPERIMENT: {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'}")
     
     # Load full datasets
-    vqa_rad_full = load_from_disk("./data/vqa_rad_subset_50")['train']
-    path_vqa_full = load_from_disk("./data/path_vqa_subset_100")['train']
+    vqa_rad_full = load_from_disk("./data/vqa_rad_subset_full")['train']
+    path_vqa_full = load_from_disk("./data/path_vqa_subset_full")['train']
     
     # Use time-based random sampling for evaluation only
     random.seed(int(time.time()))
@@ -123,8 +123,8 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     path_vqa_train = path_vqa_full
     
     # Create truly random evaluation sets (1000 images total)
-    vqa_rad_eval = vqa_rad_full.shuffle(seed=eval_seed).select(range(min(500, len(vqa_rad_full))))
-    path_vqa_eval = path_vqa_full.shuffle(seed=eval_seed+1).select(range(min(500, len(path_vqa_full))))
+    vqa_rad_eval = vqa_rad_full.shuffle(seed=eval_seed).select(range(min(100, len(vqa_rad_full))))
+    path_vqa_eval = path_vqa_full.shuffle(seed=eval_seed+1).select(range(min(100, len(path_vqa_full))))
     
     print(f"Training with {len(vqa_rad_train)} VQA-RAD and {len(path_vqa_train)} PathVQA images (FULL DATASET)")
     print(f"Evaluating with {len(vqa_rad_eval)} VQA-RAD and {len(path_vqa_eval)} PathVQA images (RANDOM SAMPLE)")
@@ -164,7 +164,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     print(f"Built RAG index with {len(vqa_rad_for_rag)} VQA-RAD and {len(path_vqa_for_rag)} PathVQA images")
 
     os.makedirs("./data", exist_ok=True)
-    file_name = f"LLM_eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}.json"
+    file_name = f"LLM_Qwen_eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}.json"
     json_path = os.path.join("./data", file_name)
     
     results_dict = {
@@ -189,8 +189,8 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
             json.dump(results_dict, f, indent=4, ensure_ascii=False)
         print(f"Saved progress '{phase_name}' to: {file_name}")
 
-    print("\n>>> INITIALIZING SHARED LLaVA-Med ENGINE...")
-    shared_llm = LLaVAMedVQA(use_4bit=True)
+    print("\n>>> INITIALIZING SHARED QWEN2-VL-7B ENGINE...")
+    shared_llm = QwenMedVQA(model_id="Qwen/Qwen2-VL-7B-Instruct", use_4bit=True)
     shared_llm.model = prepare_model_for_kbit_training(shared_llm.model)
     lora_config = LoraConfig(r=16, lora_alpha=32, target_modules=["q_proj", "v_proj"], lora_dropout=0.05, bias="none", task_type="CAUSAL_LM")
     shared_llm.model = get_peft_model(shared_llm.model, lora_config)
@@ -259,15 +259,15 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
 
     shared_llm.model.load_state_dict(global_weights, strict=False)
     
-    print("\n[4/4] Scenario: Fed-LLaVA_med-RAG")
+    print("\n[4/4] Scenario: Fed-Qwen-RAG")
     vr_c, vr_o, vr_t_rag = evaluate_dataset(shared_llm, vqa_rad_eval, evaluator, retriever_vr)
     pv_c, pv_o, pv_t_rag = evaluate_dataset(shared_llm, path_vqa_eval, evaluator, retriever_pv)
-    results_dict["Results"]["Fed-LLaVA_med-RAG"] = {
+    results_dict["Results"]["Fed-Qwen-RAG"] = {
         "VQA-RAD": format_scores_for_json(vr_c, vr_o), 
         "PathVQA": format_scores_for_json(pv_c, pv_o),
         "Inference_Time_Seconds": round(vr_t_rag + pv_t_rag, 2)
     }
-    save_current_progress("Fed-LLaVA_med-RAG")
+    save_current_progress("Fed-Qwen-RAG")
 
     print(f"\nCOMPLETED! Evaluation metrics securely saved to: {json_path}")
 
