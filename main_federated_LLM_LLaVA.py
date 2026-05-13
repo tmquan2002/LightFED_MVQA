@@ -83,7 +83,7 @@ def evaluate_dataset(shared_llm, dataset, evaluator, retriever=None):
         image = sample['image']
         
         if retriever:
-            similar_cases = retriever.search_similar_cases(image, k=2)
+            similar_cases = retriever.search_similar_cases(image, k=10)
             context_text = "Here are some similar reference cases:\n" if similar_cases else ""
             for j, case in enumerate(similar_cases):
                 context_text += f"- Ref {j+1}: Q: '{case['question']}' -> A: '{case['answer']}'\n"

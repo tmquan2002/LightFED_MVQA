@@ -73,7 +73,7 @@ class MedicalRetriever:
         self.index.add(embeddings_matrix)
         print(f"[RAG Vector] Done, FAISS currently have {self.index.ntotal} vector.")
 
-    def search_similar_cases(self, query_image, k=2):
+    def search_similar_cases(self, query_image, k=10):
         """
         Receive photos of new patients, find K cases with the most matching photos in the database.
         """
@@ -105,7 +105,7 @@ if __name__ == "__main__":
         
         print("\n--- RETRIEVAL ---")
         print(f"Original question: {test_sample['question']}")
-        similar_cases = retriever.search_similar_cases(test_image, k=2)
+        similar_cases = retriever.search_similar_cases(test_image, k=10)
         
         for i, case in enumerate(similar_cases):
             print(f"\nSimilar case #{i+1} (Vector Distance: {case['distance']:.4f}):")
