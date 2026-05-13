@@ -6,7 +6,7 @@ class MedVQARAGPipeline:
     Completed RAG system
     """
     def __init__(self, use_4bit=True):
-        print("[RAG-Pipeline] Initilize MED-VQA RAG Retriver")
+        print("[RAG-Pipeline] Initialize MED-VQA RAG Retriever")
         self.retriever = MedicalRetriever()
         self.slm = QwenMedVQA(use_4bit=use_4bit)
 

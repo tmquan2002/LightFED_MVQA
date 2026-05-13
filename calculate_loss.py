@@ -1,254 +1,505 @@
-import torch
-from torch.utils.data import DataLoader
-from datasets import load_dataset
 import json
 import os
 import time
-from transformers import AutoProcessor
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+import torch
+import psutil
+import threading
+from datetime import datetime
+from datasets import load_from_disk
+from src.data_processing.data_splitter import FederatedDataSplitter
+from src.federated.server import FederatedServer
+from src.evaluation.metrics import MedVQAEvaluator
+from src.rag_system.vector_db import MedicalRetriever
 from src.models.qwen_slm import QwenMedVQA
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, get_peft_model_state_dict
 
-# CONFIG
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BASE_DIR = "data"
-EPOCHS_DIR = os.path.join(BASE_DIR, "Epochs")
-os.makedirs(EPOCHS_DIR, exist_ok=True)
-
-# SAVE RESULTS TO JSON
-def save_loss_to_json(epoch, train_loss, val_loss, train_acc, val_acc):
-    loss_data = {
-        "epoch": epoch,
-        "training_loss": round(float(train_loss), 6),
-        "validation_loss": round(float(val_loss), 6),
-        "training_accuracy": round(float(train_acc), 4),
-        "validation_accuracy": round(float(val_acc), 4),
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-    }
-    file_path = os.path.join(EPOCHS_DIR, f"epoch_{epoch}.json")
-    with open(file_path, 'w', encoding='utf-8') as f:
-        json.dump(loss_data, f, indent=4)
-    print(f"Saved Epoch {epoch} on: {file_path}")
-
-# LOAD DATASET (STREAMING MODE)
-def get_streaming_dataloaders(batch_size=8):
-    print("Connecting Streaming with VQA-RAD and PathVQA...")
+class PerformanceMonitor:
+    """Monitor system performance during model operations"""
     
-    # Load VQA-RAD (Streaming)
-    vqa_rad = load_dataset("flaviagiammarino/vqa-rad", streaming=True)
-    # Load PathVQA (Streaming)
-    path_vqa = load_dataset("flaviagiammarino/path-vqa", streaming=True)
-    
-    train_data = path_vqa['train']
-    val_data = path_vqa['validation']
-    
-    train_data = train_data.shuffle(seed=42, buffer_size=1000)
-    
-    def preprocess_batch(batch):
-        """Preprocess batch for VQA training"""
-        # Convert images to proper format and extract text labels
-        processed_images = []
-        processed_questions = []
-        processed_labels = []
+    def __init__(self):
+        self.peak_vram = 0
+        self.peak_ram = 0
+        self.monitoring = False
+        self.monitor_thread = None
         
-        for i in range(len(batch['image'])):
-            # Handle image preprocessing - Qwen2-VL expects specific format
-            image = batch['image'][i]
-            question = batch['question'][i]
-            answer = str(batch['answer'][i]).lower()
-            
-            processed_images.append(image)
-            processed_questions.append(question)
-            
-            # Convert answer to numerical label (simplified for loss calculation)
-            # This is a placeholder - you might want to implement proper answer tokenization
-            if answer in ['yes', 'no']:
-                label = 1 if answer == 'yes' else 0
-            else:
-                # For open-ended answers, use hash as placeholder (you should improve this)
-                label = hash(answer) % 1000  # Simple placeholder
-            
-            processed_labels.append(label)
+    def start_monitoring(self):
+        """Start monitoring VRAM and RAM usage"""
+        self.monitoring = True
+        self.peak_vram = 0
+        self.peak_ram = 0
+        self.monitor_thread = threading.Thread(target=self._monitor_resources)
+        self.monitor_thread.daemon = True
+        self.monitor_thread.start()
         
+    def stop_monitoring(self):
+        """Stop monitoring and return peak usage"""
+        self.monitoring = False
+        if self.monitor_thread:
+            self.monitor_thread.join(timeout=1.0)
         return {
-            'image': processed_images,
-            'question': processed_questions,
-            'label': torch.tensor(processed_labels, dtype=torch.long)
+            'peak_vram_gb': self.peak_vram / 1024**3,
+            'peak_ram_gb': self.peak_ram / 1024**3
         }
-    
-    # Custom collate function to handle preprocessing
-    def collate_fn(batch):
-        # Convert list of dicts to dict of lists
-        batch_dict = {}
-        for key in batch[0].keys():
-            batch_dict[key] = [item[key] for item in batch]
-        return preprocess_batch(batch_dict)
-    
-    train_loader = DataLoader(train_data, batch_size=batch_size, collate_fn=collate_fn)
-    val_loader = DataLoader(val_data, batch_size=batch_size, collate_fn=collate_fn)
-    
-    return train_loader, val_loader
-
-# FOR LOOP CALCULATE LOSS 
-def monitor_streaming_loss(model, criterion, optimizer, num_epochs=10):
-    train_loader, val_loader = get_streaming_dataloaders(batch_size=2) # Reduce batch_size for memory
-    
-    # Note: QwenMedVQA handles device placement internally
-    processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct")
-    
-    for epoch in range(1, num_epochs + 1):
-        print(f"\n=== Starting Epoch {epoch} ===")
         
-        # --- PHASE: TRAINING ---
-        model.model.train()
-        total_train_loss = 0
-        correct_train = 0
-        total_train = 0
-        steps_train = 0
-        
-        for batch_idx, batch in enumerate(train_loader):
-            try:
-                # Preprocess inputs for Qwen2-VL
-                images = batch['image']
-                questions = batch['question']
-                labels = batch['label'].to(DEVICE)
-                
-                # Format inputs for Qwen2-VL
-                texts = []
-                for question in questions:
-                    texts.append(f"user\n<|vision_start|><|image_pad|><|vision_end|>{question}\nassistant\n")
-                
-                # Process inputs
-                inputs = processor(text=texts, images=images, return_tensors="pt", padding=True)
-                inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-                
-                optimizer.zero_grad()
-                
-                # Forward pass
-                outputs = model.model(**inputs)
-                logits = outputs.logits
-                
-                # Get the relevant logits for answer prediction
-                # This is simplified - you might need to adjust based on your specific task
-                batch_size = logits.shape[0]
-                seq_len = logits.shape[1]
-                vocab_size = logits.shape[2]
-                
-                # Use the last token's logits for prediction (simplified approach)
-                last_token_logits = logits[:, -1, :]
-                
-                # Calculate loss
-                loss = criterion(last_token_logits, labels)
-                
-                loss.backward()
-                optimizer.step()
-                
-                total_train_loss += loss.item()
-                steps_train += 1
-                
-                # Calculate accuracy
-                _, predicted = torch.max(last_token_logits, 1)
-                total_train += labels.size(0)
-                correct_train += (predicted == labels).sum().item()
-                
-                # Print progress every 10 steps
-                if batch_idx % 10 == 0:
-                    current_acc = 100 * correct_train / total_train if total_train > 0 else 0
-                    print(f"  Training Step {batch_idx}: Loss = {loss.item():.4f}, Acc = {current_acc:.2f}%")
-                
-                # Limit steps for testing (remove for full training)
-                if steps_train >= 50: 
-                    break
-                    
-            except Exception as e:
-                print(f"Error in training batch {batch_idx}: {e}")
-                continue
+    def _monitor_resources(self):
+        """Internal monitoring function"""
+        while self.monitoring:
+            # Monitor VRAM
+            if torch.cuda.is_available():
+                vram_used = torch.cuda.memory_allocated()
+                self.peak_vram = max(self.peak_vram, vram_used)
+            
+            # Monitor RAM
+            ram_used = psutil.virtual_memory().used
+            self.peak_ram = max(self.peak_ram, ram_used)
+            
+            time.sleep(0.1)  # Monitor every 100ms
 
-        if steps_train > 0:
-            avg_train_loss = total_train_loss / steps_train
-            train_accuracy = 100 * correct_train / total_train if total_train > 0 else 0
-        else:
-            avg_train_loss = 0.0
-            train_accuracy = 0.0
-
-        # --- PHASE: VALIDATION ---
-        model.model.eval()
-        total_val_loss = 0
-        correct_val = 0
-        total_val = 0
-        steps_val = 0
-        
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(val_loader):
-                try:
-                    images = batch['image']
-                    questions = batch['question']
-                    labels = batch['label'].to(DEVICE)
-                    
-                    # Format inputs for Qwen2-VL
-                    texts = []
-                    for question in questions:
-                        texts.append(f"user\n<|vision_start|><|image_pad|><|vision_end|>{question}\nassistant\n")
-                    
-                    inputs = processor(text=texts, images=images, return_tensors="pt", padding=True)
-                    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-                    
-                    outputs = model.model(**inputs)
-                    logits = outputs.logits
-                    last_token_logits = logits[:, -1, :]
-                    
-                    v_loss = criterion(last_token_logits, labels)
-                    
-                    total_val_loss += v_loss.item()
-                    steps_val += 1
-                    
-                    # Calculate validation accuracy
-                    _, predicted = torch.max(last_token_logits, 1)
-                    total_val += labels.size(0)
-                    correct_val += (predicted == labels).sum().item()
-                    
-                    # Limit validation steps
-                    if steps_val >= 20: 
-                        break
-                        
-                except Exception as e:
-                    print(f"Error in validation batch {batch_idx}: {e}")
-                    continue
-
-        if steps_val > 0:
-            avg_val_loss = total_val_loss / steps_val
-            val_accuracy = 100 * correct_val / total_val if total_val > 0 else 0
-        else:
-            avg_val_loss = 0.0
-            val_accuracy = 0.0
-        
-        # SAVE RESULT
-        save_loss_to_json(epoch, avg_train_loss, avg_val_loss, train_accuracy, val_accuracy)
-        print(f"Epoch {epoch} completed | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-        print(f"Train Acc: {train_accuracy:.2f}% | Val Acc: {val_accuracy:.2f}%")
-        print(f"Training steps: {steps_train} | Validation steps: {steps_val}")
-
-# RUN FILE
-if __name__ == "__main__":
-    print("=== Initializing Qwen2-VL Model for Loss Calculation ===")
+def count_parameters(model):
+    """Count trainable and total parameters"""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
-    # Initialize model with same configuration as main_federated.py
+    return {
+        'total_parameters': total_params,
+        'trainable_parameters': trainable_params,
+        'frozen_parameters': total_params - trainable_params
+    }
+
+def calculate_payload_size(model_weights):
+    """Calculate the size of model weights in MB"""
+    total_size = 0
+    for name, param in model_weights.items():
+        # Each parameter is a tensor, size = num_elements * 4 bytes (float32)
+        param_size = param.numel() * 4
+        total_size += param_size
+    
+    return total_size / (1024 * 1024)  # Convert to MB
+
+def test_fed_llava(num_clients=3, num_rounds=2):
+    """Test Fed-LLaVA approach (baseline LLaVA with federated learning)"""
+    print("\nTesting Fed-LLaVA")
+    
+    monitor = PerformanceMonitor()
+    monitor.start_monitoring()
+    
+    # Load data
+    vqa_rad_data = load_from_disk("./data/vqa_rad_subset_50")['train']
+    splitter = FederatedDataSplitter(vqa_rad_data, num_clients=num_clients)
+    client_datasets = splitter.split_iid()
+    
+    # Initialize baseline LLaVA-style model (simplified for this test)
+    print("Initializing Fed-LLaVA model")
+    model = QwenMedVQA(use_4bit=True)  # Using same base but without LoRA for comparison
+    
+    # Count parameters
+    param_stats = count_parameters(model.model)
+    
+    # Simulate federated rounds
+    server = FederatedServer()
+    payload_sizes = []
+    
+    for round_num in range(1, num_rounds + 1):
+        print(f"  Round {round_num}/{num_rounds}")
+        
+        # Simulate weight collection from clients
+        client_weights_list = []
+        for i in range(num_clients):
+            # Get full model weights (not just LoRA)
+            weights = {k: v.clone().cpu() for k, v in model.model.named_parameters()}
+            client_weights_list.append(weights)
+            
+            # Calculate payload size for this client
+            payload_size = calculate_payload_size(weights)
+            payload_sizes.append(payload_size)
+        
+        # Aggregate weights
+        global_weights = server.aggregate_weights(client_weights_list)
+        
+        # Load aggregated weights
+        model_dict = model.model.state_dict()
+        model_dict.update(global_weights)
+        model.model.load_state_dict(model_dict)
+    
+    peak_usage = monitor.stop_monitoring()
+    
+    return {
+        'approach': 'Fed-LLaVA',
+        'parameters': param_stats,
+        'peak_vram_gb': peak_usage['peak_vram_gb'],
+        'peak_ram_gb': peak_usage['peak_ram_gb'],
+        'avg_payload_mb': sum(payload_sizes) / len(payload_sizes) if payload_sizes else 0,
+        'total_payloads_mb': sum(payload_sizes),
+        'num_rounds': num_rounds,
+        'num_clients': num_clients
+    }
+
+def test_fed_slm(num_clients=3, num_rounds=2):
+    """Test Fed-SLM approach (with LoRA)"""
+    print("\nTesting Fed-SLM")
+    
+    monitor = PerformanceMonitor()
+    monitor.start_monitoring()
+    
+    # Load data
+    vqa_rad_data = load_from_disk("./data/vqa_rad_subset_50")['train']
+    splitter = FederatedDataSplitter(vqa_rad_data, num_clients=num_clients)
+    client_datasets = splitter.split_iid()
+    
+    # Initialize model with LoRA
+    print("Initializing Fed-SLM model with LoRA")
     model = QwenMedVQA(use_4bit=True)
     model.model = prepare_model_for_kbit_training(model.model)
-    
-    # LoRA configuration
     lora_config = LoraConfig(
-        r=16, 
-        lora_alpha=32, 
-        target_modules=["q_proj", "v_proj"], 
-        lora_dropout=0.05, 
-        bias="none", 
-        task_type="CAUSAL_LM"
+        r=16, lora_alpha=32, target_modules=["q_proj", "v_proj"], 
+        lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"
     )
     model.model = get_peft_model(model.model, lora_config)
     
-    # Loss function and optimizer
-    criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.model.parameters(), lr=1e-4)
+    # Count parameters
+    param_stats = count_parameters(model.model)
     
-    # Start training
-    monitor_streaming_loss(model, criterion, optimizer, num_epochs=50)
+    # Get initial LoRA weights
+    initial_lora_weights = {}
+    for k, v in get_peft_model_state_dict(model.model).items():
+        if getattr(v, "device", None) and v.device.type == 'meta':
+            initial_lora_weights[k] = torch.zeros(v.shape, dtype=v.dtype, device='cpu')
+        else:
+            initial_lora_weights[k] = v.clone().cpu()
+    
+    # Simulate federated rounds
+    server = FederatedServer()
+    payload_sizes = []
+    
+    for round_num in range(1, num_rounds + 1):
+        print(f"  Round {round_num}/{num_rounds}")
+        
+        # Simulate weight collection from clients (only LoRA weights)
+        client_weights_list = []
+        for i in range(num_clients):
+            # Only LoRA weights are transmitted
+            weights = {k: v.clone().cpu() for k, v in get_peft_model_state_dict(model.model).items()}
+            client_weights_list.append(weights)
+            
+            # Calculate payload size (only LoRA weights)
+            payload_size = calculate_payload_size(weights)
+            payload_sizes.append(payload_size)
+        
+        # Aggregate LoRA weights
+        global_weights = server.aggregate_weights(client_weights_list)
+        
+        # Load aggregated LoRA weights
+        model.model.load_state_dict(global_weights, strict=False)
+    
+    peak_usage = monitor.stop_monitoring()
+    
+    return {
+        'approach': 'Fed-SLM',
+        'parameters': param_stats,
+        'peak_vram_gb': peak_usage['peak_vram_gb'],
+        'peak_ram_gb': peak_usage['peak_ram_gb'],
+        'avg_payload_mb': sum(payload_sizes) / len(payload_sizes) if payload_sizes else 0,
+        'total_payloads_mb': sum(payload_sizes),
+        'num_rounds': num_rounds,
+        'num_clients': num_clients
+    }
+
+def test_fed_qwen2vl(num_clients=3, num_rounds=2):
+    """Test Fed-Qwen2-VL approach (LLM-Qwen2-VL-7B with federated learning)"""
+    print("\nTesting Fed-Qwen2-VL")
+    
+    monitor = PerformanceMonitor()
+    monitor.start_monitoring()
+    
+    # Load data
+    vqa_rad_data = load_from_disk("./data/vqa_rad_subset_50")['train']
+    splitter = FederatedDataSplitter(vqa_rad_data, num_clients=num_clients)
+    client_datasets = splitter.split_iid()
+    
+    # Initialize Qwen2-VL-7B model
+    print("Initializing Fed-Qwen2-VL model")
+    model = QwenMedVQA(model_id="Qwen/Qwen2-VL-7B-Instruct", use_4bit=True)
+    model.model = prepare_model_for_kbit_training(model.model)
+    lora_config = LoraConfig(
+        r=16, lora_alpha=32, target_modules=["q_proj", "v_proj"], 
+        lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"
+    )
+    model.model = get_peft_model(model.model, lora_config)
+    
+    # Count parameters
+    param_stats = count_parameters(model.model)
+    
+    # Get initial LoRA weights
+    initial_lora_weights = {}
+    for k, v in get_peft_model_state_dict(model.model).items():
+        if getattr(v, "device", None) and v.device.type == 'meta':
+            initial_lora_weights[k] = torch.zeros(v.shape, dtype=v.dtype, device='cpu')
+        else:
+            initial_lora_weights[k] = v.clone().cpu()
+    
+    # Simulate federated rounds
+    server = FederatedServer()
+    payload_sizes = []
+    
+    for round_num in range(1, num_rounds + 1):
+        print(f"  Round {round_num}/{num_rounds}")
+        
+        # Simulate weight collection from clients (only LoRA weights)
+        client_weights_list = []
+        for i in range(num_clients):
+            # Only LoRA weights are transmitted
+            weights = {k: v.clone().cpu() for k, v in get_peft_model_state_dict(model.model).items()}
+            client_weights_list.append(weights)
+            
+            # Calculate payload size (only LoRA weights)
+            payload_size = calculate_payload_size(weights)
+            payload_sizes.append(payload_size)
+        
+        # Aggregate LoRA weights
+        global_weights = server.aggregate_weights(client_weights_list)
+        
+        # Load aggregated LoRA weights
+        model.model.load_state_dict(global_weights, strict=False)
+    
+    peak_usage = monitor.stop_monitoring()
+    
+    return {
+        'approach': 'Fed-Qwen2-VL',
+        'parameters': param_stats,
+        'peak_vram_gb': peak_usage['peak_vram_gb'],
+        'peak_ram_gb': peak_usage['peak_ram_gb'],
+        'avg_payload_mb': sum(payload_sizes) / len(payload_sizes) if payload_sizes else 0,
+        'total_payloads_mb': sum(payload_sizes),
+        'num_rounds': num_rounds,
+        'num_clients': num_clients
+    }
+
+def test_fed_slm_rag(num_clients=3, num_rounds=2):
+    """Test Fed-SLM + RAG approach (current full model)"""
+    print("\nTesting Fed-SLM + RAG")
+    
+    monitor = PerformanceMonitor()
+    monitor.start_monitoring()
+    
+    # Load data
+    vqa_rad_data = load_from_disk("./data/vqa_rad_subset_50")['train']
+    path_vqa_data = load_from_disk("./data/path_vqa_subset_100")['train']
+    splitter = FederatedDataSplitter(vqa_rad_data, num_clients=num_clients)
+    client_datasets = splitter.split_iid()
+    
+    # Initialize model with LoRA
+    print("Initializing Fed-SLM + RAG model...")
+    model = QwenMedVQA(use_4bit=True)
+    model.model = prepare_model_for_kbit_training(model.model)
+    lora_config = LoraConfig(
+        r=16, lora_alpha=32, target_modules=["q_proj", "v_proj"], 
+        lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"
+    )
+    model.model = get_peft_model(model.model, lora_config)
+    
+    # Build RAG databases (additional memory overhead)
+    print("Building RAG vector databases...")
+    retriever_vr = MedicalRetriever()
+    retriever_vr.build_index_from_dataset(vqa_rad_data)
+    retriever_pv = MedicalRetriever()
+    retriever_pv.build_index_from_dataset(path_vqa_data)
+    
+    # Count parameters
+    param_stats = count_parameters(model.model)
+    
+    # Get initial LoRA weights
+    initial_lora_weights = {}
+    for k, v in get_peft_model_state_dict(model.model).items():
+        if getattr(v, "device", None) and v.device.type == 'meta':
+            initial_lora_weights[k] = torch.zeros(v.shape, dtype=v.dtype, device='cpu')
+        else:
+            initial_lora_weights[k] = v.clone().cpu()
+    
+    # Simulate federated rounds
+    server = FederatedServer()
+    payload_sizes = []
+    
+    for round_num in range(1, num_rounds + 1):
+        print(f"  Round {round_num}/{num_rounds}")
+        
+        # Simulate weight collection from clients (only LoRA weights)
+        client_weights_list = []
+        for i in range(num_clients):
+            # Only LoRA weights are transmitted
+            weights = {k: v.clone().cpu() for k, v in get_peft_model_state_dict(model.model).items()}
+            client_weights_list.append(weights)
+            
+            # Calculate payload size (only LoRA weights)
+            payload_size = calculate_payload_size(weights)
+            payload_sizes.append(payload_size)
+        
+        # Aggregate LoRA weights
+        global_weights = server.aggregate_weights(client_weights_list)
+        
+        # Load aggregated LoRA weights
+        model.model.load_state_dict(global_weights, strict=False)
+    
+    peak_usage = monitor.stop_monitoring()
+    
+    return {
+        'approach': 'Fed-SLM + RAG',
+        'parameters': param_stats,
+        'peak_vram_gb': peak_usage['peak_vram_gb'],
+        'peak_ram_gb': peak_usage['peak_ram_gb'],
+        'avg_payload_mb': sum(payload_sizes) / len(payload_sizes) if payload_sizes else 0,
+        'total_payloads_mb': sum(payload_sizes),
+        'num_rounds': num_rounds,
+        'num_clients': num_clients
+    }
+
+def save_comparison_results(results, filename="computational_comparison.json"):
+    """Save comparison results to JSON file"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    comparison_data = {
+        "timestamp": timestamp,
+        "experiment_config": {
+            "num_clients": results[0]['num_clients'] if results else 0,
+            "num_rounds": results[0]['num_rounds'] if results else 0
+        },
+        "results": results,
+        "summary": {
+            "parameter_efficiency": {},
+            "memory_efficiency": {},
+            "communication_efficiency": {}
+        }
+    }
+    
+    # Calculate summary statistics
+    if len(results) >= 2:
+        # Parameter efficiency (trainable parameters / total parameters)
+        for result in results:
+            approach = result['approach']
+            params = result['parameters']
+            if params['total_parameters'] > 0:
+                efficiency = (params['trainable_parameters'] / params['total_parameters']) * 100
+                comparison_data["summary"]["parameter_efficiency"][approach] = round(efficiency, 2)
+            else:
+                comparison_data["summary"]["parameter_efficiency"][approach] = 0.0
+        
+        # Memory efficiency (inverse of VRAM usage)
+        vram_values = [r['peak_vram_gb'] for r in results if r['peak_vram_gb'] > 0]
+        if vram_values:  # Check if list is not empty
+            min_vram = min(vram_values)
+            for result in results:
+                approach = result['approach']
+                if result['peak_vram_gb'] > 0:
+                    efficiency = min_vram / result['peak_vram_gb'] * 100
+                    comparison_data["summary"]["memory_efficiency"][approach] = round(efficiency, 2)
+                else:
+                    comparison_data["summary"]["memory_efficiency"][approach] = 0.0
+        else:
+            # All VRAM values are zero, set all to 0
+            for result in results:
+                comparison_data["summary"]["memory_efficiency"][result['approach']] = 0.0
+        
+        # Communication efficiency (inverse of payload size)
+        payload_values = [r['avg_payload_mb'] for r in results if r['avg_payload_mb'] > 0]
+        if payload_values:  # Check if list is not empty
+            min_payload = min(payload_values)
+            for result in results:
+                approach = result['approach']
+                if result['avg_payload_mb'] > 0:
+                    efficiency = min_payload / result['avg_payload_mb'] * 100
+                    comparison_data["summary"]["communication_efficiency"][approach] = round(efficiency, 2)
+                else:
+                    comparison_data["summary"]["communication_efficiency"][approach] = 0.0
+        else:
+            # All payload values are zero, set all to 0
+            for result in results:
+                comparison_data["summary"]["communication_efficiency"][result['approach']] = 0.0
+    
+    # Save to file
+    os.makedirs("./data", exist_ok=True)
+    filepath = os.path.join("./data", filename)
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(comparison_data, f, indent=4, ensure_ascii=False)
+    
+    print(f"\n✅ Results saved to: {filepath}")
+    return filepath
+
+def print_comparison_table(results):
+    """Print a formatted comparison table"""
+    print("\n" + "="*100)
+    print("COMPUTATIONAL COMPARISON TABLE")
+    print("="*100)
+    
+    header = f"{'Approach':<20} {'Total Params':<15} {'Trainable':<12} {'VRAM (GB)':<12} {'RAM (GB)':<12} {'Payload (MB)':<15}"
+    print(header)
+    print("-" * 100)
+    
+    for result in results:
+        approach = result['approach']
+        total_params = f"{result['parameters']['total_parameters']:,}"
+        trainable_params = f"{result['parameters']['trainable_parameters']:,}"
+        vram = f"{result['peak_vram_gb']:.2f}"
+        ram = f"{result['peak_ram_gb']:.2f}"
+        payload = f"{result['avg_payload_mb']:.2f}"
+        
+        row = f"{approach:<20} {total_params:<15} {trainable_params:<12} {vram:<12} {ram:<12} {payload:<15}"
+        print(row)
+    
+    print("="*100)
+
+def get_user_setup():
+    """Get user configuration for comparison"""
+    print("\n=== Computational Comparison Setup ===")
+    
+    while True:
+        try:
+            num_clients = int(input("1. Enter number of clients (e.g., 3, 5): "))
+            if num_clients >= 2: break
+            else: print("At least 2 clients required!")
+        except ValueError: print("Please enter a valid integer!")
+
+    while True:
+        try:
+            num_rounds = int(input("2. Enter number of rounds (e.g., 2, 3): "))
+            if num_rounds >= 1: break
+            else: print("At least 1 round required!")
+        except ValueError: print("Please enter a valid integer!")
+    
+    return num_clients, num_rounds
+
+if __name__ == "__main__":
+    print("=== Federated Learning Computational Comparison ===")
+    print("Comparing: Fed-LLaVA vs Fed-SLM vs Fed-Qwen2-VL vs Fed-SLM+RAG")
+    
+    # Get user configuration
+    clients, rounds = get_user_setup()
+    
+    print(f"\nStarting comparison with {clients} clients and {rounds} rounds...")
+    print("This may take several minutes...\n")
+    
+    results = []
+    
+    try:
+        # Test each approach
+        result1 = test_fed_llava(clients, rounds)
+        results.append(result1)
+        
+        result2 = test_fed_slm(clients, rounds)
+        results.append(result2)
+        
+        result3 = test_fed_qwen2vl(clients, rounds)
+        results.append(result3)
+        
+        result4 = test_fed_slm_rag(clients, rounds)
+        results.append(result4)
+        
+        # Print results
+        print_comparison_table(results)
+        
+        # Save results
+        save_comparison_results(results)
+        
+        print("\n=== Comparison Complete! ===")
+        
+    except Exception as e:
+        print(f"\n❌ Error during comparison: {e}")
+        print("Please check your setup and try again.")
