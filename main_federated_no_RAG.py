@@ -80,13 +80,33 @@ def evaluate_dataset(shared_slm, dataset, evaluator):
     return evaluator.evaluate_closed_ended(closed_preds, closed_refs), evaluator.evaluate_open_ended(open_preds, open_refs), infer_time
 
 def run_federated_simulation_no_rag(num_clients, num_rounds, epochs, split_type, alpha):
-    print(f"\nSTARTING EXPERIMENT: {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'}")
+    # Load full datasets
+    vqa_rad_full = load_from_disk("./data/vqa_rad_subset_full")['train']
+    path_vqa_full = load_from_disk("./data/path_vqa_subset_full")['train']
     
-    vqa_rad_data = load_from_disk("./data/vqa_rad_subset_50")['train']
-    path_vqa_data = load_from_disk("./data/path_vqa_subset_100")['train']
+    # Use time-based random sampling for evaluation only
+    import random
+    random.seed(int(time.time()))
+    eval_seed = random.randint(0, 1000000)
     
-    splitter = FederatedDataSplitter(vqa_rad_data, num_clients=num_clients)
+    print(f"Using random evaluation seed: {eval_seed}")
     
+    # Train on ENTIRE dataset
+    vqa_rad_train = vqa_rad_full
+    path_vqa_train = path_vqa_full
+    
+    # Create truly random evaluation sets (1000 images total)
+    vqa_rad_eval = vqa_rad_full.shuffle(seed=eval_seed).select(range(min(100, len(vqa_rad_full))))
+    path_vqa_eval = path_vqa_full.shuffle(seed=eval_seed+1).select(range(min(100, len(path_vqa_full))))
+    
+    print(f"Training with {len(vqa_rad_train)} VQA-RAD and {len(path_vqa_train)} PathVQA images (FULL DATASET)")
+    print(f"Evaluating with {len(vqa_rad_eval)} VQA-RAD and {len(path_vqa_eval)} PathVQA images (RANDOM SAMPLE)")
+    
+    # Make data splitter use random seed for true variability
+    splitter_seed = random.randint(0, 1000000)
+    splitter = FederatedDataSplitter(vqa_rad_train, num_clients=num_clients, seed=splitter_seed)
+    print(f"Using splitter seed: {splitter_seed}")
+
     if split_type == 'iid':
         print(f"\n[1/3] Splitting data using IID for {num_clients} Hospitals...")
         client_datasets = splitter.split_iid()
@@ -203,8 +223,8 @@ def run_federated_simulation_no_rag(num_clients, num_rounds, epochs, split_type,
     shared_slm.model.load_state_dict(global_weights, strict=False)
     
     print(f"\n[3/3] Scenario: Evaluation (No RAG)")
-    vr_c, vr_o, vr_t = evaluate_dataset(shared_slm, vqa_rad_data, evaluator)
-    pv_c, pv_o, pv_t = evaluate_dataset(shared_slm, path_vqa_data, evaluator)
+    vr_c, vr_o, vr_t = evaluate_dataset(shared_slm, vqa_rad_eval, evaluator)
+    pv_c, pv_o, pv_t = evaluate_dataset(shared_slm, path_vqa_eval, evaluator)
     results_dict["Results"]["Federated_No_RAG"] = {
         "VQA-RAD": format_scores_for_json(vr_c, vr_o), 
         "PathVQA": format_scores_for_json(pv_c, pv_o),
