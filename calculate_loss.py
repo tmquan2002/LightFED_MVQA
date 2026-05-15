@@ -84,7 +84,7 @@ def test_fed_llava(num_clients=3, num_rounds=2):
     monitor.start_monitoring()
     
     # Load data
-    vqa_rad_data = load_from_disk("./data/vqa_rad_subset_50")['train']
+    vqa_rad_data = load_from_disk("./data/vqa_rad_subset_100")['train']
     splitter = FederatedDataSplitter(vqa_rad_data, num_clients=num_clients)
     client_datasets = splitter.split_iid()
     
@@ -142,7 +142,7 @@ def test_fed_slm(num_clients=3, num_rounds=2):
     monitor.start_monitoring()
     
     # Load data
-    vqa_rad_data = load_from_disk("./data/vqa_rad_subset_50")['train']
+    vqa_rad_data = load_from_disk("./data/vqa_rad_subset_100")['train']
     splitter = FederatedDataSplitter(vqa_rad_data, num_clients=num_clients)
     client_datasets = splitter.split_iid()
     
@@ -282,8 +282,8 @@ def test_fed_slm_rag(num_clients=3, num_rounds=2):
     monitor.start_monitoring()
     
     # Load data
-    vqa_rad_data = load_from_disk("./data/vqa_rad_subset_50")['train']
-    path_vqa_data = load_from_disk("./data/path_vqa_subset_100")['train']
+    vqa_rad_data = load_from_disk("./data/vqa_rad_subset_full")['train']
+    path_vqa_data = load_from_disk("./data/path_vqa_subset_full")['train']
     splitter = FederatedDataSplitter(vqa_rad_data, num_clients=num_clients)
     client_datasets = splitter.split_iid()
     

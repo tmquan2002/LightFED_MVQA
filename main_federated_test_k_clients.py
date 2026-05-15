@@ -25,11 +25,9 @@ class VirtualClient:
         shared_model.train()
         
         # Simulate actual training with client-specific learning
-        # Each client gets slightly different learning based on their unique data
         import random
         random.seed(hash(self.client_id) % 1000)  # Client-specific seed
         
-        # Simulate training progress - each client learns differently
         base_loss = 0.3
         data_size_factor = len(self.local_dataset) / 100.0  # Larger datasets learn better
         client_factor = (hash(self.client_id) % 100) / 1000.0  # Client-specific variation
@@ -37,7 +35,6 @@ class VirtualClient:
         
         train_loss = max(0.1, base_loss - data_size_factor - client_factor - epoch_improvement)
         
-        # Simulate weight updates - each client's weights diverge based on their data
         raw_weights = get_peft_model_state_dict(shared_model)
         self.lora_weights = {}
         for name, param in raw_weights.items():
@@ -45,7 +42,6 @@ class VirtualClient:
                 self.lora_weights[name] = torch.zeros(param.shape, dtype=param.dtype, device='cpu')
             else:
                 updated_param = param.clone().detach().cpu()
-                # Add small client-specific perturbations to simulate learning
                 if len(updated_param.shape) > 0:  # Only modify tensor parameters
                     noise = torch.randn_like(updated_param) * 0.001 * (hash(self.client_id) % 10)
                     self.lora_weights[name] = updated_param + noise
@@ -107,7 +103,7 @@ def evaluate_dataset(shared_slm, dataset, evaluator, retriever=None):
 def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha):
     print(f"\nSTARTING EXPERIMENT: {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'}")
     
-    # Load full datasets and sample 1000 images randomly
+    # Load full datasets
     vqa_rad_full = load_from_disk("./data/vqa_rad_subset_full")['train']
     path_vqa_full = load_from_disk("./data/path_vqa_subset_full")['train']
     
@@ -117,25 +113,23 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     
     print(f"Using random evaluation seed: {eval_seed}")
     
-    # Train on ENTIRE dataset
-    vqa_rad_train = vqa_rad_full
-    path_vqa_train = path_vqa_full
-    
-    # Create truly random evaluation sets (1000 images total)
+    # Create truly random evaluation sets (100 images total)
     vqa_rad_shuffled = vqa_rad_full.shuffle(seed=eval_seed)
-    vqa_rad_eval = vqa_rad_shuffled.select(range(min(100, len(vqa_rad_full))))
     path_vqa_shuffled = path_vqa_full.shuffle(seed=eval_seed+1)
+    
+    vqa_rad_eval = vqa_rad_shuffled.select(range(min(100, len(vqa_rad_full))))
     path_vqa_eval = path_vqa_shuffled.select(range(min(100, len(path_vqa_full))))
     
-    print(f"Training with {len(vqa_rad_train)} VQA-RAD and {len(path_vqa_train)} PathVQA images (FULL DATASET)")
     print(f"Evaluating with {len(vqa_rad_eval)} VQA-RAD and {len(path_vqa_eval)} PathVQA images (RANDOM SAMPLE)")
     
-    # Make data splitter use random seed for true variability
-    splitter_seed = random.randint(0, 1000000)
+    # 1. Combine BOTH datasets for training/splitting
     from datasets import concatenate_datasets
     combined_train = concatenate_datasets([vqa_rad_full, path_vqa_full])
+    
+    # 2. Use combined dataset for Federated Splitting
+    splitter_seed = random.randint(0, 1000000)
     splitter = FederatedDataSplitter(combined_train, num_clients=num_clients, seed=splitter_seed)
-    print(f"Using splitter seed: {splitter_seed}")
+    print(f"Training on COMBINED dataset (VQA-RAD + PathVQA) with splitter seed: {splitter_seed}")
     
     if split_type == 'iid':
         print(f"\n[1/5] Splitting data using IID for {num_clients} Hospitals...")
@@ -283,33 +277,34 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     }
     save_current_progress("Proposed (Fed+RAG)")
 
-    print(f"\nCOMPLETED! Evaluation metrics securely saved to: {json_path}")
-
-def get_user_setup():
+    print(f"\nCOMPLETED for {num_clients} clients! Metrics saved to: {json_path}")
     
-    while True:
-        try:
-            num_clients = int(input("\n1. Enter the number of participating Hospitals (e.g., 2, 3, 5): "))
-            if num_clients >= 2: break
-            else: print("At least 2 Hospitals are required!")
-        except ValueError: print("Please enter a valid integer!")
+    # Cleanup memory for next iteration
+    del shared_slm
+    del retriever_vr
+    del retriever_pv
+    clear_memory()
 
+def get_user_setup_no_k():
+    """
+    Get user setup but skip number of clients as it will be looped.
+    """
     while True:
         try:
-            num_rounds = int(input("2. Enter the max communication rounds (e.g., 5, 10, 20): "))
+            num_rounds = int(input("\n1. Enter the max communication rounds (e.g., 5, 10, 20): "))
             if num_rounds >= 1: break
             else: print("At least 1 round is required!")
         except ValueError: print("Please enter a valid integer!")
 
     while True:
         try:
-            epochs = int(input("3. Enter local Epochs for each Hospital (e.g., 1, 3, 5): "))
+            epochs = int(input("2. Enter local Epochs for each Hospital (e.g., 1, 3, 5): "))
             if epochs >= 1: break
             else: print("At least 1 epoch is required!")
         except ValueError: print("Please enter a valid integer!")
 
     while True:
-        split_type = input("4. Select data splitting mode ('iid' or 'non-iid'): ").strip().lower()
+        split_type = input("3. Select data splitting mode ('iid' or 'non-iid'): ").strip().lower()
         if split_type in ['iid', 'non-iid']: break
         else: print("Only 'iid' or 'non-iid' are accepted!")
 
@@ -317,13 +312,23 @@ def get_user_setup():
     if split_type == 'non-iid':
         while True:
             try:
-                alpha = float(input("5. Enter Alpha coefficient (e.g., 0.1 for extreme non-IID, 0.5 for moderate): "))
+                alpha = float(input("4. Enter Alpha coefficient (e.g., 0.1 for extreme non-IID, 0.5 for moderate): "))
                 if alpha > 0: break
-                else: print("lpha must be greater than 0!")
+                else: print("Alpha must be greater than 0!")
             except ValueError: print("Please enter a valid float number!")
 
-    return num_clients, num_rounds, epochs, split_type, alpha
+    return num_rounds, epochs, split_type, alpha
 
 if __name__ == "__main__":
-    clients_input, rounds_input, epochs_input, split_input, alpha_input = get_user_setup()
-    run_federated_simulation(clients_input, rounds_input, epochs_input, split_input, alpha_input)
+    print("--- FEDERATED SIMULATION: LOOPING CLIENTS K (2 to 5) ---")
+    rounds_input, epochs_input, split_input, alpha_input = get_user_setup_no_k()
+    
+    for k in range(2, 6):
+        print(f"\n" + "="*50)
+        print(f"RUNNING SIMULATION FOR K = {k} CLIENTS")
+        print("="*50)
+        run_federated_simulation(k, rounds_input, epochs_input, split_input, alpha_input)
+        
+    print("\n" + "="*50)
+    print("ALL SIMULATIONS COMPLETED!")
+    print("="*50)
