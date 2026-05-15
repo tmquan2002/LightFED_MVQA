@@ -81,8 +81,11 @@ def evaluate_dataset(shared_slm, dataset, evaluator):
 
 def run_federated_simulation_no_rag(num_clients, num_rounds, epochs, split_type, alpha):
     # Load full datasets
-    vqa_rad_full = load_from_disk("./data/vqa_rad_subset_full")['train']
-    path_vqa_full = load_from_disk("./data/path_vqa_subset_full")['train']
+    # Load Train and Test splits separately
+    vqa_rad_train = load_from_disk("./data/vqa_rad_full/train")
+    path_vqa_train = load_from_disk("./data/path_vqa_full/train")
+    vqa_rad_test = load_from_disk("./data/vqa_rad_full/test")
+    path_vqa_test = load_from_disk("./data/path_vqa_full/test")
     
     # Use time-based random sampling for evaluation only
     import random
@@ -92,19 +95,24 @@ def run_federated_simulation_no_rag(num_clients, num_rounds, epochs, split_type,
     print(f"Using random evaluation seed: {eval_seed}")
     
     # Train on ENTIRE dataset
-    vqa_rad_train = vqa_rad_full
-    path_vqa_train = path_vqa_full
-    
     # Create truly random evaluation sets (1000 images total)
-    vqa_rad_eval = vqa_rad_full.shuffle(seed=eval_seed).select(range(min(100, len(vqa_rad_full))))
-    path_vqa_eval = path_vqa_full.shuffle(seed=eval_seed+1).select(range(min(100, len(path_vqa_full))))
+    # 1. Prepare evaluation sets (using official Test data)
+    vqa_rad_shuffled = vqa_rad_test.shuffle(seed=eval_seed)
+    path_vqa_shuffled = path_vqa_test.shuffle(seed=eval_seed+1)
     
-    print(f"Training with {len(vqa_rad_train)} VQA-RAD and {len(path_vqa_train)} PathVQA images (FULL DATASET)")
-    print(f"Evaluating with {len(vqa_rad_eval)} VQA-RAD and {len(path_vqa_eval)} PathVQA images (RANDOM SAMPLE)")
+    eval_size = 100
+    vqa_rad_eval = vqa_rad_shuffled.select(range(min(eval_size, len(vqa_rad_test))))
+    path_vqa_eval = path_vqa_shuffled.select(range(min(eval_size, len(path_vqa_test))))
     
-    # Make data splitter use random seed for true variability
+    print(f"Evaluating with {len(vqa_rad_eval)} VQA-RAD and {len(path_vqa_eval)} PathVQA images (from official TEST set)")
+    
+    # 2. Combine BOTH datasets for training/splitting
+    from datasets import concatenate_datasets
+    combined_train = concatenate_datasets([vqa_rad_train, path_vqa_train])
+    
+    # 3. Use combined dataset for Federated Splitting
     splitter_seed = random.randint(0, 1000000)
-    splitter = FederatedDataSplitter(vqa_rad_train, num_clients=num_clients, seed=splitter_seed)
+    splitter = FederatedDataSplitter(combined_train, num_clients=num_clients, seed=splitter_seed)
     print(f"Using splitter seed: {splitter_seed}")
 
     if split_type == 'iid':

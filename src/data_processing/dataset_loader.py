@@ -27,43 +27,35 @@ def create_subset(dataset_name, num_samples=50, save_path=None):
     return subset_dict
 
 def load_full_datasets(dataset_name, save_path=None):
+    """
+    Downloads the dataset and saves both 'train' and 'test' splits to disk.
+    """
+    print(f"[Loader] Loading full dataset: {dataset_name}...")
     full_dataset = load_dataset(dataset_name)
-    subset_train = full_dataset['train']
-
-    subset_dict = DatasetDict({'train': subset_train})
-
+    
     if save_path:
         os.makedirs(save_path, exist_ok=True)
-        subset_dict.save_to_disk(save_path)
-        print(f"[Loader] Saved {dataset_name} at: {save_path}\n")
+        # Save each split separately (train, test, validation if any)
+        for split in full_dataset.keys():
+            split_path = os.path.join(save_path, split)
+            full_dataset[split].save_to_disk(split_path)
+            print(f"[Loader] Saved {dataset_name} ({split} split) at: {split_path}")
         
-    return subset_dict
+    return full_dataset
 
 if __name__ == "__main__":
-    print("--- Create Subset ---")
+    print("--- Download and Save Full Datasets (Train + Test) ---")
     
-    # # Create subset for VQA-RAD
-    # create_subset(
-    #     dataset_name="flaviagiammarino/vqa-rad", 
-    #     num_samples=50, 
-    #     save_path="./data/vqa_rad_subset_50"
-    # )
-    
-    # # Create subset for PathVQA
-    # create_subset(
-    #     dataset_name="flaviagiammarino/path-vqa", 
-    #     num_samples=100, 
-    #     save_path="./data/path_vqa_subset_100"
-    # )
-
-    # Create subset all for VQA-RAD
+    # 1. Process VQA-RAD
+    # This will create ./data/vqa_rad_full/train and ./data/vqa_rad_full/test
     load_full_datasets(
         dataset_name="flaviagiammarino/vqa-rad", 
-        save_path="./data/vqa_rad_subset_full"
+        save_path="./data/vqa_rad_full"
     )
     
-    # Create subset all for PathVQA
+    # 2. Process PathVQA
+    # This will create ./data/path_vqa_full/train and ./data/path_vqa_full/test
     load_full_datasets(
         dataset_name="flaviagiammarino/path-vqa",
-        save_path="./data/path_vqa_subset_full"
+        save_path="./data/path_vqa_full"
     )

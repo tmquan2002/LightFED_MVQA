@@ -1,3 +1,4 @@
+from numpy import random
 import json
 import os
 import time
@@ -5,7 +6,7 @@ import torch
 import psutil
 import threading
 from datetime import datetime
-from datasets import load_from_disk
+from datasets import load_from_disk, concatenate_datasets
 from src.data_processing.data_splitter import FederatedDataSplitter
 from src.federated.server import FederatedServer
 from src.evaluation.metrics import MedVQAEvaluator
@@ -83,9 +84,30 @@ def test_fed_llava(num_clients=3, num_rounds=2):
     monitor = PerformanceMonitor()
     monitor.start_monitoring()
     
-    # Load data
-    vqa_rad_data = load_from_disk("./data/vqa_rad_subset_50")['train']
-    splitter = FederatedDataSplitter(vqa_rad_data, num_clients=num_clients)
+    # Load Train and Test splits separately
+    vqa_rad_train = load_from_disk("./data/vqa_rad_full/train")
+    path_vqa_train = load_from_disk("./data/path_vqa_full/train")
+    vqa_rad_test = load_from_disk("./data/vqa_rad_full/test")
+    path_vqa_test = load_from_disk("./data/path_vqa_full/test")
+    eval_seed = 42
+
+    # 1. Prepare evaluation sets (using official Test data)
+    vqa_rad_shuffled = vqa_rad_test.shuffle(seed=eval_seed)
+    path_vqa_shuffled = path_vqa_test.shuffle(seed=eval_seed+1)
+    
+    eval_size = 100
+    vqa_rad_eval = vqa_rad_shuffled.select(range(min(eval_size, len(vqa_rad_test))))
+    path_vqa_eval = path_vqa_shuffled.select(range(min(eval_size, len(path_vqa_test))))
+    
+    print(f"Evaluating with {len(vqa_rad_eval)} VQA-RAD and {len(path_vqa_eval)} PathVQA images (from official TEST set)")
+    
+    # 2. Combine BOTH datasets for training/splitting
+    combined_train = concatenate_datasets([vqa_rad_train, path_vqa_train])
+    
+    # 3. Use combined dataset for Federated Splitting
+    splitter_seed = random.randint(0, 1000000)
+    splitter = FederatedDataSplitter(combined_train, num_clients=num_clients, seed=splitter_seed)
+    print(f"Training on COMBINED dataset (VQA-RAD + PathVQA) with splitter seed: {splitter_seed}")
     client_datasets = splitter.split_iid()
     
     # Initialize baseline LLaVA-style model (simplified for this test)
@@ -141,9 +163,13 @@ def test_fed_slm(num_clients=3, num_rounds=2):
     monitor = PerformanceMonitor()
     monitor.start_monitoring()
     
-    # Load data
-    vqa_rad_data = load_from_disk("./data/vqa_rad_subset_50")['train']
-    splitter = FederatedDataSplitter(vqa_rad_data, num_clients=num_clients)
+    # Load Train and Test splits separately
+    vqa_rad_train = load_from_disk("./data/vqa_rad_full/train")
+    path_vqa_train = load_from_disk("./data/path_vqa_full/train")
+    
+    # Combine datasets for training
+    combined_train = concatenate_datasets([vqa_rad_train, path_vqa_train])
+    splitter = FederatedDataSplitter(combined_train, num_clients=num_clients)
     client_datasets = splitter.split_iid()
     
     # Initialize model with LoRA
@@ -206,15 +232,18 @@ def test_fed_slm(num_clients=3, num_rounds=2):
 
 def test_fed_slm_rag(num_clients=3, num_rounds=2):
     """Test Fed-SLM + RAG approach (current full model)"""
-    print("\nesting Fed-SLM + RAG")
+    print("\nTesting Fed-SLM + RAG")
     
     monitor = PerformanceMonitor()
     monitor.start_monitoring()
     
-    # Load data
-    vqa_rad_data = load_from_disk("./data/vqa_rad_subset_50")['train']
-    path_vqa_data = load_from_disk("./data/path_vqa_subset_100")['train']
-    splitter = FederatedDataSplitter(vqa_rad_data, num_clients=num_clients)
+    # Load Train and Test splits separately
+    vqa_rad_train = load_from_disk("./data/vqa_rad_full/train")
+    path_vqa_train = load_from_disk("./data/path_vqa_full/train")
+    
+    # Combine datasets for training
+    combined_train = concatenate_datasets([vqa_rad_train, path_vqa_train])
+    splitter = FederatedDataSplitter(combined_train, num_clients=num_clients)
     client_datasets = splitter.split_iid()
     
     # Initialize model with LoRA
@@ -229,10 +258,13 @@ def test_fed_slm_rag(num_clients=3, num_rounds=2):
     
     # Build RAG databases (additional memory overhead)
     print("Building RAG vector databases...")
-    retriever_vr = MedicalRetriever()
-    retriever_vr.build_index_from_dataset(vqa_rad_data)
-    retriever_pv = MedicalRetriever()
-    retriever_pv.build_index_from_dataset(path_vqa_data)
+    eval_seed = 42
+    # Build RAG pool from Training data only
+    vqa_rad_rag_pool = vqa_rad_train.shuffle(seed=eval_seed+2).select(range(min(2000, len(vqa_rad_train))))
+    path_vqa_rag_pool = path_vqa_train.shuffle(seed=eval_seed+3).select(range(min(2000, len(path_vqa_train))))
+    
+    retriever_vr = MedicalRetriever(); retriever_vr.build_index_from_dataset(vqa_rad_rag_pool)
+    retriever_pv = MedicalRetriever(); retriever_pv.build_index_from_dataset(path_vqa_rag_pool)
     
     # Count parameters
     param_stats = count_parameters(model.model)

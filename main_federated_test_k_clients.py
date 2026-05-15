@@ -103,9 +103,11 @@ def evaluate_dataset(shared_slm, dataset, evaluator, retriever=None):
 def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha):
     print(f"\nSTARTING EXPERIMENT: {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'}")
     
-    # Load full datasets
-    vqa_rad_full = load_from_disk("./data/vqa_rad_subset_full")['train']
-    path_vqa_full = load_from_disk("./data/path_vqa_subset_full")['train']
+    # Load Train and Test splits separately
+    vqa_rad_train = load_from_disk("./data/vqa_rad_full/train")
+    path_vqa_train = load_from_disk("./data/path_vqa_full/train")
+    vqa_rad_test = load_from_disk("./data/vqa_rad_full/test")
+    path_vqa_test = load_from_disk("./data/path_vqa_full/test")
     
     # Use time-based random sampling for evaluation only
     random.seed(int(time.time()))
@@ -113,20 +115,21 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     
     print(f"Using random evaluation seed: {eval_seed}")
     
-    # Create truly random evaluation sets (100 images total)
-    vqa_rad_shuffled = vqa_rad_full.shuffle(seed=eval_seed)
-    path_vqa_shuffled = path_vqa_full.shuffle(seed=eval_seed+1)
+    # 1. Prepare evaluation sets (using official Test data)
+    vqa_rad_shuffled = vqa_rad_test.shuffle(seed=eval_seed)
+    path_vqa_shuffled = path_vqa_test.shuffle(seed=eval_seed+1)
     
-    vqa_rad_eval = vqa_rad_shuffled.select(range(min(100, len(vqa_rad_full))))
-    path_vqa_eval = path_vqa_shuffled.select(range(min(100, len(path_vqa_full))))
+    eval_size = 100
+    vqa_rad_eval = vqa_rad_shuffled.select(range(min(eval_size, len(vqa_rad_test))))
+    path_vqa_eval = path_vqa_shuffled.select(range(min(eval_size, len(path_vqa_test))))
     
-    print(f"Evaluating with {len(vqa_rad_eval)} VQA-RAD and {len(path_vqa_eval)} PathVQA images (RANDOM SAMPLE)")
+    print(f"Evaluating with {len(vqa_rad_eval)} VQA-RAD and {len(path_vqa_eval)} PathVQA images (from official TEST set)")
     
-    # 1. Combine BOTH datasets for training/splitting
+    # 2. Combine BOTH datasets for training/splitting
     from datasets import concatenate_datasets
-    combined_train = concatenate_datasets([vqa_rad_full, path_vqa_full])
+    combined_train = concatenate_datasets([vqa_rad_train, path_vqa_train])
     
-    # 2. Use combined dataset for Federated Splitting
+    # 3. Use combined dataset for Federated Splitting
     splitter_seed = random.randint(0, 1000000)
     splitter = FederatedDataSplitter(combined_train, num_clients=num_clients, seed=splitter_seed)
     print(f"Training on COMBINED dataset (VQA-RAD + PathVQA) with splitter seed: {splitter_seed}")
@@ -151,15 +154,14 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
 
     print("\n[2/5] Building RAG Vector Database (FAISS) - LEAKAGE FREE...")
     
-    # EXCLUDE evaluation samples from RAG database to prevent "cheating"
-    # We take samples from index 100 onwards (the first 100 were used for evaluation)
-    vqa_rad_rag_pool = vqa_rad_shuffled.select(range(min(100, len(vqa_rad_shuffled)), min(2100, len(vqa_rad_shuffled))))
-    path_vqa_rag_pool = path_vqa_shuffled.select(range(min(100, len(path_vqa_shuffled)), min(2100, len(path_vqa_shuffled))))
+    # Build RAG pool from Training data only (Absolute zero leakage from Test set)
+    vqa_rad_rag_pool = vqa_rad_train.shuffle(seed=eval_seed+2).select(range(min(2000, len(vqa_rad_train))))
+    path_vqa_rag_pool = path_vqa_train.shuffle(seed=eval_seed+3).select(range(min(2000, len(path_vqa_train))))
     
     retriever_vr = MedicalRetriever(); retriever_vr.build_index_from_dataset(vqa_rad_rag_pool)
     retriever_pv = MedicalRetriever(); retriever_pv.build_index_from_dataset(path_vqa_rag_pool)
     
-    print(f"Built RAG index with {len(vqa_rad_rag_pool)} VQA-RAD and {len(path_vqa_rag_pool)} PathVQA images (Disjoint from Eval sets)")
+    print(f"Built RAG index with {len(vqa_rad_rag_pool)} VQA-RAD and {len(path_vqa_rag_pool)} PathVQA images (from Train set)")
 
     os.makedirs("./data", exist_ok=True)
     file_name = f"eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}.json"
