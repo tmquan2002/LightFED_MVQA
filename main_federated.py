@@ -82,14 +82,27 @@ def evaluate_dataset(shared_slm, dataset, evaluator, retriever=None):
         image = sample['image']
         
         if retriever:
-            similar_cases = retriever.search_similar_cases(image, k=10)
-            context_text = "Here are some similar reference cases:\n" if similar_cases else ""
+            # Use a more focused k=5 to avoid distracting the SLM
+            similar_cases = retriever.search_similar_cases(image, k=5)
+            
+            context_text = "### Medical Reference Cases:\n" if similar_cases else ""
             for j, case in enumerate(similar_cases):
-                context_text += f"- Ref {j+1}: Q: '{case['question']}' -> A: '{case['answer']}'\n"
-            augmented_question = f"{context_text}\nNow, please answer this new Question: {question}"
+                context_text += f"Case {j+1}: Q: '{case['question']}' -> A: '{case['answer']}'\n"
+            
+            # Optimized Prompt for Medical SLM
+            augmented_question = (
+                f"{context_text}\n"
+                "### Instruction:\n"
+                "You are a medical expert. Based on the provided image and the similar reference cases above, "
+                f"answer the following question concisely.\n\n"
+                f"Question: {question}\n"
+                "Answer:"
+            )
             pred = shared_slm.predict(image, augmented_question)
         else:
-            pred = shared_slm.predict(image, question)
+            # Concise prompt for direct prediction
+            direct_prompt = f"Answer this medical question concisely based on the image: {question}\nAnswer:"
+            pred = shared_slm.predict(image, direct_prompt)
             
         if ground_truth in ['yes', 'no'] or len(ground_truth.split()) <= 2:
             closed_preds.append(pred)
@@ -161,14 +174,13 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     print("\n[2/5] Building RAG Vector Database (FAISS) - LEAKAGE FREE...")
     
     # Build RAG pool from Training data only (Absolute zero leakage from Test set)
-    # We take samples from the training set to build the RAG database
-    vqa_rad_rag_pool = vqa_rad_train.shuffle(seed=eval_seed+2).select(range(min(2000, len(vqa_rad_train))))
-    path_vqa_rag_pool = path_vqa_train.shuffle(seed=eval_seed+3).select(range(min(2000, len(path_vqa_train))))
+    vqa_rad_rag_pool = vqa_rad_train # Use all available training data
+    path_vqa_rag_pool = path_vqa_train.shuffle(seed=eval_seed+3).select(range(min(5000, len(path_vqa_train))))
     
     retriever_vr = MedicalRetriever(); retriever_vr.build_index_from_dataset(vqa_rad_rag_pool)
     retriever_pv = MedicalRetriever(); retriever_pv.build_index_from_dataset(path_vqa_rag_pool)
     
-    print(f"Built RAG index with {len(vqa_rad_rag_pool)} VQA-RAD and {len(path_vqa_rag_pool)} PathVQA images (Disjoint from Eval sets)")
+    print(f"Built RAG index with {len(vqa_rad_rag_pool)} VQA-RAD and {len(path_vqa_rag_pool)} PathVQA images (Strictly Training data)")
 
     os.makedirs("./data", exist_ok=True)
     file_name = f"eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}.json"
