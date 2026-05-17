@@ -4,7 +4,7 @@ import gc
 import time
 import torch
 import random
-from datasets import load_from_disk
+from datasets import load_dataset
 from src.data_processing.data_splitter import FederatedDataSplitter
 from src.federated.server import FederatedServer
 from src.evaluation.metrics import MedVQAEvaluator
@@ -19,40 +19,94 @@ class VirtualClient:
         self.local_dataset = local_dataset
         self.lora_weights = {k: v.clone() for k, v in initial_weights.items()}
 
-    def train_local(self, shared_model, epochs=1):
+    def train_local(self, shared_slm, epochs=1):
+        import torch.optim as optim
+        from qwen_vl_utils import process_vision_info
+        
         print(f"  [{self.client_id}] Training locally for {epochs} epoch(s)...")
-        shared_model.load_state_dict(self.lora_weights, strict=False)
-        shared_model.train()
+        model = shared_slm.model
+        processor = shared_slm.processor
+        device = shared_slm.device
         
-        # Simulate actual training with client-specific learning
-        # Each client gets slightly different learning based on their unique data
-        import random
-        random.seed(hash(self.client_id) % 1000)  # Client-specific seed
+        model.load_state_dict(self.lora_weights, strict=False)
+        model.train()
         
-        # Simulate training progress - each client learns differently
-        base_loss = 0.3
-        data_size_factor = len(self.local_dataset) / 100.0  # Larger datasets learn better
-        client_factor = (hash(self.client_id) % 100) / 1000.0  # Client-specific variation
-        epoch_improvement = epochs * 0.02  # Improvement per epoch
+        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-5)
         
-        train_loss = max(0.1, base_loss - data_size_factor - client_factor - epoch_improvement)
+        total_loss = 0.0
+        steps = 0
         
-        # Simulate weight updates - each client's weights diverge based on their data
-        raw_weights = get_peft_model_state_dict(shared_model)
+        indices = list(range(len(self.local_dataset)))
+        
+        for epoch in range(epochs):
+            import random
+            random.shuffle(indices)
+            for i, idx in enumerate(indices):
+                sample = self.local_dataset[idx]
+                question = sample['question']
+                answer = str(sample['answer']).lower()
+                
+                img_obj = shared_slm._preprocess_image(sample['image'])
+                
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": img_obj},
+                            {"type": "text", "text": question},
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": answer}
+                        ]
+                    }
+                ]
+                
+                text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+                image_inputs, video_inputs = process_vision_info(messages)
+                
+                inputs = processor(
+                    text=[text],
+                    images=image_inputs,
+                    videos=video_inputs,
+                    padding=True,
+                    return_tensors="pt",
+                ).to(device)
+                
+                # Copy input_ids to labels for Causal LM loss
+                inputs['labels'] = inputs['input_ids'].clone()
+                
+                optimizer.zero_grad()
+                
+                # Standard forward and backward pass
+                outputs = model(**inputs)
+                loss = outputs.loss
+                
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
+                steps += 1
+                
+                if i % 10 == 0:
+                    print(f"    [{self.client_id}] Epoch {epoch+1}/{epochs} | Step {i}/{len(indices)} | Loss: {loss.item():.4f}   ", end="\r")
+                    
+        print()  # newline after progress
+        
+        avg_loss = total_loss / steps if steps > 0 else 0.0
+        
+        # Save updated LoRA weights
+        raw_weights = get_peft_model_state_dict(model)
         self.lora_weights = {}
         for name, param in raw_weights.items():
-            if param.device.type == 'meta':
+            if getattr(param, "device", None) and param.device.type == 'meta':
                 self.lora_weights[name] = torch.zeros(param.shape, dtype=param.dtype, device='cpu')
             else:
-                updated_param = param.clone().detach().cpu()
-                # Add small client-specific perturbations to simulate learning
-                if len(updated_param.shape) > 0:  # Only modify tensor parameters
-                    noise = torch.randn_like(updated_param) * 0.001 * (hash(self.client_id) % 10)
-                    self.lora_weights[name] = updated_param + noise
-                else:
-                    self.lora_weights[name] = updated_param
+                self.lora_weights[name] = param.clone().detach().cpu()
                 
-        return self.lora_weights, train_loss
+        return self.lora_weights, avg_loss
 
 def clear_memory():
     gc.collect()
@@ -120,12 +174,14 @@ def evaluate_dataset(shared_slm, dataset, evaluator, retriever=None):
 def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha):
     print(f"\nSTARTING EXPERIMENT: {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'}")
     
-    # Load full datasets and sample 1000 images randomly
-    # Load Train and Test splits separately
-    vqa_rad_train = load_from_disk("./data/vqa_rad_full/train")
-    path_vqa_train = load_from_disk("./data/path_vqa_full/train")
-    vqa_rad_test = load_from_disk("./data/vqa_rad_full/test")
-    path_vqa_test = load_from_disk("./data/path_vqa_full/test")
+    # Load directly from Hugging Face Hub
+    vqa_rad = load_dataset("flaviagiammarino/vqa-rad")
+    path_vqa = load_dataset("flaviagiammarino/path-vqa")
+    
+    vqa_rad_train = vqa_rad["train"]
+    path_vqa_train = path_vqa["train"]
+    vqa_rad_test = vqa_rad["test"]
+    path_vqa_test = path_vqa["test"]
     
     # Use time-based random sampling for evaluation only
     random.seed(int(time.time()))
@@ -243,7 +299,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
         client_losses = []
         
         for client in clients:
-            weights, loss = client.train_local(shared_slm.model, epochs=epochs)
+            weights, loss = client.train_local(shared_slm, epochs=epochs)
             client_weights_list.append(weights)
             client_losses.append(loss)
             

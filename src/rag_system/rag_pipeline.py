@@ -41,10 +41,10 @@ class MedVQARAGPipeline:
 
 # Testing Pipeline
 if __name__ == "__main__":
-    from datasets import load_from_disk
+    from datasets import load_dataset
     
     try:
-        dataset = load_from_disk("./data/vqa_rad_subset_50")['train']
+        dataset = load_dataset("flaviagiammarino/vqa-rad")['train'].select(range(50))
         pipeline = MedVQARAGPipeline(use_4bit=True)
         knowledge_base = dataset.select(range(49))
         pipeline.load_knowledge_base(knowledge_base)

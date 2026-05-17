@@ -6,7 +6,7 @@ import torch
 import psutil
 import threading
 from datetime import datetime
-from datasets import load_from_disk, concatenate_datasets
+from datasets import load_dataset, concatenate_datasets
 from src.data_processing.data_splitter import FederatedDataSplitter
 from src.federated.server import FederatedServer
 from src.evaluation.metrics import MedVQAEvaluator
@@ -85,10 +85,14 @@ def test_fed_llava(num_clients=3, num_rounds=2):
     monitor.start_monitoring()
     
     # Load Train and Test splits separately
-    vqa_rad_train = load_from_disk("./data/vqa_rad_full/train")
-    path_vqa_train = load_from_disk("./data/path_vqa_full/train")
-    vqa_rad_test = load_from_disk("./data/vqa_rad_full/test")
-    path_vqa_test = load_from_disk("./data/path_vqa_full/test")
+    # Load directly from Hugging Face Hub
+    vqa_rad = load_dataset("flaviagiammarino/vqa-rad")
+    path_vqa = load_dataset("flaviagiammarino/path-vqa")
+    
+    vqa_rad_train = vqa_rad["train"]
+    path_vqa_train = path_vqa["train"]
+    vqa_rad_test = vqa_rad["test"]
+    path_vqa_test = path_vqa["test"]
     eval_seed = 42
 
     # 1. Prepare evaluation sets (using official Test data)
@@ -164,8 +168,11 @@ def test_fed_slm(num_clients=3, num_rounds=2):
     monitor.start_monitoring()
     
     # Load Train and Test splits separately
-    vqa_rad_train = load_from_disk("./data/vqa_rad_full/train")
-    path_vqa_train = load_from_disk("./data/path_vqa_full/train")
+    # Load directly from Hugging Face Hub
+    vqa_rad = load_dataset("flaviagiammarino/vqa-rad")
+    path_vqa = load_dataset("flaviagiammarino/path-vqa")
+    vqa_rad_train = vqa_rad["train"]
+    path_vqa_train = path_vqa["train"]
     
     # Combine datasets for training
     combined_train = concatenate_datasets([vqa_rad_train, path_vqa_train])
@@ -238,8 +245,11 @@ def test_fed_slm_rag(num_clients=3, num_rounds=2):
     monitor.start_monitoring()
     
     # Load Train and Test splits separately
-    vqa_rad_train = load_from_disk("./data/vqa_rad_full/train")
-    path_vqa_train = load_from_disk("./data/path_vqa_full/train")
+    # Load directly from Hugging Face Hub
+    vqa_rad = load_dataset("flaviagiammarino/vqa-rad")
+    path_vqa = load_dataset("flaviagiammarino/path-vqa")
+    vqa_rad_train = vqa_rad["train"]
+    path_vqa_train = path_vqa["train"]
     
     # Combine datasets for training
     combined_train = concatenate_datasets([vqa_rad_train, path_vqa_train])

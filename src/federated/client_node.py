@@ -98,11 +98,11 @@ class MedVQAClient:
 
 # Test 1 client
 if __name__ == "__main__":
-    from datasets import load_from_disk
+    from datasets import load_dataset
     from src.data_processing.data_splitter import FederatedDataSplitter
     
     try:
-        dataset = load_from_disk("./data/vqa_rad_subset_50")['train']
+        dataset = load_dataset("flaviagiammarino/vqa-rad")['train'].select(range(50))
         splitter = FederatedDataSplitter(dataset, num_clients=2)
         client_datasets = splitter.split_iid()
         

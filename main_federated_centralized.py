@@ -4,7 +4,7 @@ import gc
 import time
 import torch
 import random
-from datasets import load_from_disk, concatenate_datasets
+from datasets import load_dataset, concatenate_datasets
 from src.data_processing.data_splitter import FederatedDataSplitter
 from src.federated.server import FederatedServer
 from src.evaluation.metrics import MedVQAEvaluator
@@ -67,10 +67,14 @@ def run_centralized_simulation(num_clients, num_rounds, epochs, split_type, alph
     
     # Load full datasets
     # Load Train and Test splits separately
-    vqa_rad_train = load_from_disk("./data/vqa_rad_full/train")
-    path_vqa_train = load_from_disk("./data/path_vqa_full/train")
-    vqa_rad_test = load_from_disk("./data/vqa_rad_full/test")
-    path_vqa_test = load_from_disk("./data/path_vqa_full/test")
+    # Load directly from Hugging Face Hub
+    vqa_rad = load_dataset("flaviagiammarino/vqa-rad")
+    path_vqa = load_dataset("flaviagiammarino/path-vqa")
+    
+    vqa_rad_train = vqa_rad["train"]
+    path_vqa_train = path_vqa["train"]
+    vqa_rad_test = vqa_rad["test"]
+    path_vqa_test = path_vqa["test"]
     
     # Use time-based random sampling for evaluation only
     random.seed(int(time.time()))
@@ -171,27 +175,80 @@ def run_centralized_simulation(num_clients, num_rounds, epochs, split_type, alph
     
     start_train_time = time.time() # START TRAINING TIMER
     
-    # Simulate centralized training (better performance than federated)
-    base_loss = 0.3
-    data_size_factor = len(vqa_rad_centralized) / 100.0  # Larger datasets learn better
-    epoch_improvement = epochs * 0.03  # Better improvement per epoch (centralized advantage)
+    # Actual PyTorch Training Loop
+    import torch.optim as optim
+    from qwen_vl_utils import process_vision_info
     
-    final_loss = max(0.05, base_loss - data_size_factor - epoch_improvement)  # Lower final loss (upper bound)
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, centralized_slm.model.parameters()), lr=2e-5)
     
-    # Simulate weight updates for centralized model
+    total_loss = 0.0
+    steps = 0
+    indices = list(range(len(vqa_rad_centralized)))
+    
+    for epoch in range(epochs):
+        random.shuffle(indices)
+        for i, idx in enumerate(indices):
+            sample = vqa_rad_centralized[idx]
+            question = sample['question']
+            answer = str(sample['answer']).lower()
+            
+            img_obj = centralized_slm._preprocess_image(sample['image'])
+            
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": img_obj},
+                        {"type": "text", "text": question},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": answer}
+                    ]
+                }
+            ]
+            
+            text = centralized_slm.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            image_inputs, video_inputs = process_vision_info(messages)
+            
+            inputs = centralized_slm.processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            ).to(centralized_slm.device)
+            
+            inputs['labels'] = inputs['input_ids'].clone()
+            
+            optimizer.zero_grad()
+            
+            with torch.amp.autocast('cuda', dtype=torch.float16):
+                outputs = centralized_slm.model(**inputs)
+                loss = outputs.loss
+            
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            steps += 1
+            
+            if i % 10 == 0:
+                print(f"    Epoch {epoch+1}/{epochs} | Step {i}/{len(indices)} | Loss: {loss.item():.4f}   ", end="\r")
+                
+    print()  # newline after progress
+    
+    final_loss = total_loss / steps if steps > 0 else 0.0
+    
     raw_weights = get_peft_model_state_dict(centralized_slm.model)
     centralized_weights = {}
     for name, param in raw_weights.items():
         if getattr(param, "device", None) and param.device.type == 'meta':
             centralized_weights[name] = torch.zeros(param.shape, dtype=param.dtype, device='cpu')
         else:
-            updated_param = param.clone().detach().cpu()
-            # Add centralized training improvements (better convergence)
-            if len(updated_param.shape) > 0:
-                noise = torch.randn_like(updated_param) * 0.0005  # Smaller noise (better stability)
-                centralized_weights[name] = updated_param + noise
-            else:
-                centralized_weights[name] = updated_param
+            centralized_weights[name] = param.clone().detach().cpu()
     
     end_train_time = time.time() # END TRAINING TIMER
     total_train_time = round(end_train_time - start_train_time, 2)

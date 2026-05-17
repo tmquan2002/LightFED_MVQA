@@ -4,7 +4,7 @@ import gc
 import time
 import torch
 import random
-from datasets import load_from_disk
+from datasets import load_dataset
 from src.data_processing.data_splitter import FederatedDataSplitter
 from src.federated.server import FederatedServer
 from src.evaluation.metrics import MedVQAEvaluator
@@ -104,10 +104,14 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     print(f"\nSTARTING EXPERIMENT: {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'}")
     
     # Load Train and Test splits separately
-    vqa_rad_train = load_from_disk("./data/vqa_rad_full/train")
-    path_vqa_train = load_from_disk("./data/path_vqa_full/train")
-    vqa_rad_test = load_from_disk("./data/vqa_rad_full/test")
-    path_vqa_test = load_from_disk("./data/path_vqa_full/test")
+    # Load directly from Hugging Face Hub
+    vqa_rad = load_dataset("flaviagiammarino/vqa-rad")
+    path_vqa = load_dataset("flaviagiammarino/path-vqa")
+    
+    vqa_rad_train = vqa_rad["train"]
+    path_vqa_train = path_vqa["train"]
+    vqa_rad_test = vqa_rad["test"]
+    path_vqa_test = path_vqa["test"]
     
     # Use time-based random sampling for evaluation only
     random.seed(int(time.time()))

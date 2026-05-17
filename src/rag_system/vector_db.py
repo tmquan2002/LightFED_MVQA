@@ -93,11 +93,11 @@ class MedicalRetriever:
 
 # Testing Rag System
 if __name__ == "__main__":
-    from datasets import load_from_disk
+    from datasets import load_dataset
     retriever = MedicalRetriever()
     
     try:
-        dataset = load_from_disk("./data/vqa_rad_subset_50")['train']
+        dataset = load_dataset("flaviagiammarino/vqa-rad")['train'].select(range(50))
         print(f"[RAG Vector] Loaded {len(dataset)} samples")
         retriever.build_index_from_dataset(dataset)
         test_sample = dataset[-1]
