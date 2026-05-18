@@ -1,18 +1,28 @@
+# PyTorch CUDA 12.1 index (ensures GPU support on Windows instead of CPU-only)
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# Deep Learning Core
+torch>=2.6.0
+torchvision
+torchaudio
+
+# Multimodal & LLM/SLM
+transformers>=4.48.0
+peft>=0.12.0
+accelerate>=0.34.0
+bitsandbytes>=0.42.0
+qwen-vl-utils>=0.0.4
+av
+
+# RAG & Vector Search
+faiss-cpu
+scikit-learn
+numpy>=1.24.0,<2.0.0
+
+# Utilities
 datasets
 pillow
 matplotlib
 jupyter
-torch
-torchvision
-torchaudio
-transformers
-peft
-accelerate
-bitsandbytes
-faiss-cpu
-numpy
 tqdm
 wandb
-qwen-vl-utils
-av
-scikit-learn
