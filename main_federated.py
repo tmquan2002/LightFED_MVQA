@@ -1,5 +1,7 @@
 import json
 import os
+# Fix duplicate OpenMP runtime library error on Windows/Anaconda
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import gc
 import time
 import torch
