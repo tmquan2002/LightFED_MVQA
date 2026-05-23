@@ -80,8 +80,7 @@ class QwenMedVQA:
                 **inputs, 
                 max_new_tokens=50,
                 do_sample=False,        
-                num_beams=3,            
-                early_stopping=True,
+                num_beams=1,            
                 pad_token_id=self.processor.tokenizer.pad_token_id,
                 eos_token_id=self.processor.tokenizer.eos_token_id
             )

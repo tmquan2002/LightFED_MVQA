@@ -26,7 +26,7 @@ def format_scores_for_json(c_scores, o_scores):
         "ROUGE-L": round(o_scores.get('ROUGE-L', 0) * 100, 1)
     }
 
-def evaluate_dataset(shared_slm, dataset, evaluator, retriever=None, k=2):
+def evaluate_dataset(shared_slm, dataset, evaluator, retriever=None, c=2):
     shared_slm.model.eval() 
     closed_preds, closed_refs, open_preds, open_refs = [], [], [], []
     test_samples = dataset
@@ -41,7 +41,7 @@ def evaluate_dataset(shared_slm, dataset, evaluator, retriever=None, k=2):
         image = sample['image']
         
         if retriever:
-            similar_cases = retriever.search_similar_cases(image, k=k)
+            similar_cases = retriever.search_similar_cases(image, c=c)
             context_text = "Here are some similar reference cases:\n" if similar_cases else ""
             for j, case in enumerate(similar_cases):
                 context_text += f"- Ref {j+1}: Q: '{case['question']}' -> A: '{case['answer']}'\n"
@@ -169,11 +169,11 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     shared_slm.model = get_peft_model(shared_slm.model, lora_config)
     
     initial_lora_weights = {}
-    for k, v in get_peft_model_state_dict(shared_slm.model).items():
+    for key, v in get_peft_model_state_dict(shared_slm.model).items():
         if getattr(v, "device", None) and v.device.type == 'meta':
-            initial_lora_weights[k] = torch.zeros(v.shape, dtype=v.dtype, device='cpu')
+            initial_lora_weights[key] = torch.zeros(v.shape, dtype=v.dtype, device='cpu')
         else:
-            initial_lora_weights[k] = v.clone().cpu()
+            initial_lora_weights[key] = v.clone().cpu()
 
     print(f"\n[3/5] Scenario: Federated Learning (Training across {num_clients} Hospitals for {num_rounds} Rounds)")
     
@@ -201,9 +201,10 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
             client_weights_list.append(weights)
             client_losses.append(loss)
             
-        global_weights = server.aggregate_weights(client_weights_list)
+        client_sizes = [len(c.local_dataset) for c in clients]
+        global_weights = server.aggregate_weights(client_weights_list, client_sizes=client_sizes)
         for client in clients:
-            client.lora_weights = {k: v.clone() for k, v in global_weights.items()}
+            client.lora_weights = {key: v.clone() for key, v in global_weights.items()}
             
         avg_loss = sum(client_losses) / len(client_losses)
         final_loss = avg_loss
@@ -232,22 +233,22 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
 
     shared_slm.model.load_state_dict(global_weights, strict=False)
     
-    print("\n[4/5] Scenario: Proposed (Fed + RAG) - Testing different k values")
+    print("\n[4/5] Scenario: Proposed (Fed + RAG) - Testing different c values")
     os.makedirs("./data/retriever_test", exist_ok=True)
     
-    # Test k from 1 to 10
-    for k in range(6, 11):
-        print(f"\n  Testing with k={k} retrieved cases...")
+    # Test c from 6 to 10
+    for c in range(6, 11):
+        print(f"\n  Testing with c={c} retrieved cases...")
         
-        vr_c, vr_o, vr_t_rag = evaluate_dataset(shared_slm, vqa_rad_eval, evaluator, retriever_vr, k=k)
-        pv_c, pv_o, pv_t_rag = evaluate_dataset(shared_slm, path_vqa_eval, evaluator, retriever_pv, k=k)
+        vr_c, vr_o, vr_t_rag = evaluate_dataset(shared_slm, vqa_rad_eval, evaluator, retriever_vr, c=c)
+        pv_c, pv_o, pv_t_rag = evaluate_dataset(shared_slm, path_vqa_eval, evaluator, retriever_pv, c=c)
         
-        # Save results for this k value
-        k_results = {
+        # Save results for this c value
+        c_results = {
             "Experiment_Config": results_dict["Experiment_Config"],
             "Training_Stats": results_dict["Training_Stats"],
             "Results": {
-                f"Fed+RAG_k{k}": {
+                f"Fed+RAG_c{c}": {
                     "VQA-RAD": format_scores_for_json(vr_c, vr_o), 
                     "PathVQA": format_scores_for_json(pv_c, pv_o),
                     "Inference_Time_Seconds": round(vr_t_rag + pv_t_rag, 2)
@@ -255,21 +256,21 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
             }
         }
         
-        k_file_name = f"eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}_k{k}.json"
-        k_json_path = os.path.join("./data/retriever_test", k_file_name)
+        c_file_name = f"eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}_c{c}.json"
+        c_json_path = os.path.join("./data/retriever_test", c_file_name)
         
-        with open(k_json_path, "w", encoding="utf-8") as f:
-            json.dump(k_results, f, indent=4, ensure_ascii=False)
-        print(f"  Saved k={k} results to: {k_file_name}")
+        with open(c_json_path, "w", encoding="utf-8") as f:
+            json.dump(c_results, f, indent=4, ensure_ascii=False)
+        print(f"  Saved c={c} results to: {c_file_name}")
         
         # Also add to main results dict
-        results_dict["Results"][f"Fed+RAG_k{k}"] = {
+        results_dict["Results"][f"Fed+RAG_c{c}"] = {
             "VQA-RAD": format_scores_for_json(vr_c, vr_o), 
             "PathVQA": format_scores_for_json(pv_c, pv_o),
             "Inference_Time_Seconds": round(vr_t_rag + pv_t_rag, 2)
         }
     
-    save_current_progress("Fed+RAG (All k values tested)")
+    save_current_progress("Fed+RAG (All c values tested)")
 
     print(f"\nCOMPLETED! Evaluation metrics securely saved to: {json_path}")
 
@@ -307,7 +308,7 @@ def get_user_setup():
             try:
                 alpha = float(input("5. Enter Alpha coefficient (e.g., 0.1 for extreme non-IID, 0.5 for moderate): "))
                 if alpha > 0: break
-                else: print("lpha must be greater than 0!")
+                else: print("Alpha must be greater than 0!")
             except ValueError: print("Please enter a valid float number!")
 
     return num_clients, num_rounds, epochs, split_type, alpha

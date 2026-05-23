@@ -203,7 +203,8 @@ def run_federated_simulation_no_rag(num_clients, num_rounds, epochs, split_type,
             client_weights_list.append(weights)
             client_losses.append(loss)
             
-        global_weights = server.aggregate_weights(client_weights_list)
+        client_sizes = [len(c.local_dataset) for c in clients]
+        global_weights = server.aggregate_weights(client_weights_list, client_sizes=client_sizes)
         for client in clients:
             client.lora_weights = {k: v.clone() for k, v in global_weights.items()}
             

@@ -67,9 +67,9 @@ This project provided seperate scripts for comparison purpose
 ```bash
 python calculate_loss.py
 ```
-- Calculate performance based on number of retriver k
+- Calculate performance based on number of retriever c
 ```bash
-python main_federated_test_retriever_k.py
+python main_federated_test_retriever_c.py
 ```
 - Centralized setup
 ```bash

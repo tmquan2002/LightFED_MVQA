@@ -36,6 +36,7 @@ class MedicalRetriever:
     def get_image_embedding(self, image):
         """Convert an image into a 1D NumPy Array."""
         image = self._preprocess_image(image)
+        # pyrefly: ignore [unexpected-keyword]
         inputs = self.processor(images=image, return_tensors="pt").to(self.device)
         
         with torch.no_grad():
@@ -73,15 +74,15 @@ class MedicalRetriever:
         self.index.add(embeddings_matrix)
         print(f"[RAG Vector] Done, FAISS currently have {self.index.ntotal} vector.")
 
-    def search_similar_cases(self, query_image, k=10):
+    def search_similar_cases(self, query_image, c=10):
         """
-        Receive photos of new patients, find K cases with the most matching photos in the database.
+        Receive photos of new patients, find C cases with the most matching photos in the database.
         """
         if self.index.ntotal == 0:
             return []
             
         query_vector = self.get_image_embedding(query_image).astype('float32')
-        distances, indices = self.index.search(query_vector, k)
+        distances, indices = self.index.search(query_vector, c)
         results = []
         for idx, dist in zip(indices[0], distances[0]):
             if idx != -1:
@@ -105,7 +106,7 @@ if __name__ == "__main__":
         
         print("\n--- RETRIEVAL ---")
         print(f"Original question: {test_sample['question']}")
-        similar_cases = retriever.search_similar_cases(test_image, k=10)
+        similar_cases = retriever.search_similar_cases(test_image, c=10)
         
         for i, case in enumerate(similar_cases):
             print(f"\nSimilar case #{i+1} (Vector Distance: {case['distance']:.4f}):")

@@ -14,12 +14,12 @@ class MedVQARAGPipeline:
         """Loading hospital data into FAISS"""
         self.retriever.build_index_from_dataset(dataset)
 
-    def predict(self, image, question, top_k=10):
+    def predict(self, image, question, top_c=10):
         """
         Predict answer with RAG
         """
         # Find similar cases
-        similar_cases = self.retriever.search_similar_cases(image, k=top_k)
+        similar_cases = self.retriever.search_similar_cases(image, c=top_c)
         
         # Build prompt
         context_text = ""
@@ -52,7 +52,7 @@ if __name__ == "__main__":
         prediction = pipeline.predict(
             image=test_sample['image'], 
             question=test_sample['question'], 
-            top_k=10
+            top_c=10
         )
         
         print(f"Original question: {test_sample['question']}")
