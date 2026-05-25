@@ -21,7 +21,7 @@ class VirtualClient:
         self.local_dataset = local_dataset
         self.lora_weights = {k: v.clone() for k, v in initial_weights.items()}
 
-    def train_local(self, shared_slm, epochs=1):
+    def train_local(self, shared_slm, epochs=1, max_steps=400):
         import torch.optim as optim
         from qwen_vl_utils import process_vision_info
         
@@ -34,6 +34,7 @@ class VirtualClient:
         model.train()
         
         optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-5)
+        scaler = torch.amp.GradScaler('cuda')
         optimizer.zero_grad()
         
         total_loss = 0.0
@@ -44,7 +45,9 @@ class VirtualClient:
         for epoch in range(epochs):
             import random
             random.shuffle(indices)
-            for i, idx in enumerate(indices):
+            epoch_indices = indices[:max_steps]  # Cap training samples per round
+            print(f"    [{self.client_id}] Using {len(epoch_indices)}/{len(indices)} samples this round")
+            for i, idx in enumerate(epoch_indices):
                 sample = self.local_dataset[idx]
                 question = sample['question']
                 answer = str(sample['answer']).lower()
@@ -81,22 +84,23 @@ class VirtualClient:
                 # Copy input_ids to labels for Causal LM loss
                 inputs['labels'] = inputs['input_ids'].clone()
                 
-                # Mixed precision forward pass
+                # Mixed precision forward pass with GradScaler
                 with torch.amp.autocast('cuda', dtype=torch.float16):
                     outputs = model(**inputs)
                     loss = outputs.loss / 4  # Gradient accumulation scale (steps=4)
                 
-                loss.backward()
+                scaler.scale(loss).backward()
                 
-                if (i + 1) % 4 == 0 or (i + 1) == len(indices):
-                    optimizer.step()
+                if (i + 1) % 4 == 0 or (i + 1) == len(epoch_indices):
+                    scaler.step(optimizer)
+                    scaler.update()
                     optimizer.zero_grad()
                 
                 total_loss += loss.item() * 4  # Restore original loss scale for stats
                 steps += 1
                 
                 if i % 10 == 0:
-                    print(f"    [{self.client_id}] Epoch {epoch+1}/{epochs} | Step {i}/{len(indices)} | Loss: {loss.item():.4f}   ", end="\r")
+                    print(f"    [{self.client_id}] Epoch {epoch+1}/{epochs} | Step {i}/{len(epoch_indices)} | Loss: {loss.item():.4f}   ", end="\r")
                     
         print()  # newline after progress
         
@@ -126,55 +130,66 @@ def format_scores_for_json(c_scores, o_scores):
         "ROUGE-L": round(o_scores.get('ROUGE-L', 0) * 100, 1)
     }
 
-def evaluate_dataset(shared_slm, dataset, evaluator, retriever=None):
-    shared_slm.model.eval() 
-    closed_preds, closed_refs, open_preds, open_refs = [], [], [], []
-    test_samples = dataset
-    total = len(test_samples)
+def evaluate_dataset_combined(shared_slm, dataset, evaluator, retriever):
+    """Single-pass evaluation: computes both No-RAG and RAG predictions simultaneously."""
+    shared_slm.model.eval()
+    norag_cp, norag_cr, norag_op, norag_or_ = [], [], [], []
+    rag_cp, rag_cr, rag_op, rag_or_ = [], [], [], []
+    total = len(dataset)
     
-    start_infer_time = time.time() # START INFERENCE TIMER
+    norag_time = 0.0
+    rag_time = 0.0
     
-    for i, sample in enumerate(test_samples):
+    for i, sample in enumerate(dataset):
         print(f"Evaluating: {i+1}/{total} images...", end="\r")
         question = sample['question']
         ground_truth = str(sample['answer']).lower()
         image = sample['image']
         
-        if retriever:
-            # Use a more focused c=5 to avoid distracting the SLM
-            similar_cases = retriever.search_similar_cases(image, c=5)
-            
-            context_text = "### Medical Reference Cases:\n" if similar_cases else ""
-            for j, case in enumerate(similar_cases):
-                context_text += f"Case {j+1}: Q: '{case['question']}' -> A: '{case['answer']}'\n"
-            
-            # Optimized Prompt for Medical SLM
-            augmented_question = (
-                f"{context_text}\n"
-                "### Instruction:\n"
-                "You are a medical expert. Based on the provided image and the similar reference cases above, "
-                f"answer the following question concisely.\n\n"
-                f"Question: {question}\n"
-                "Answer:"
-            )
-            pred = shared_slm.predict(image, augmented_question)
+        # No-RAG prediction
+        t0 = time.time()
+        direct_prompt = f"Answer this medical question concisely based on the image: {question}\nAnswer:"
+        pred_norag = shared_slm.predict(image, direct_prompt)
+        norag_time += time.time() - t0
+        
+        # RAG prediction
+        t1 = time.time()
+        similar_cases = retriever.search_similar_cases(image, c=5)
+        context_text = "### Medical Reference Cases:\n" if similar_cases else ""
+        for j, case in enumerate(similar_cases):
+            context_text += f"Case {j+1}: Q: '{case['question']}' -> A: '{case['answer']}'\n"
+        augmented_question = (
+            f"{context_text}\n"
+            "### Instruction:\n"
+            "You are a medical expert. Based on the provided image and the similar reference cases above, "
+            f"answer the following question concisely.\n\n"
+            f"Question: {question}\n"
+            "Answer:"
+        )
+        pred_rag = shared_slm.predict(image, augmented_question)
+        rag_time += time.time() - t1
+        
+        # Classify into closed/open ended
+        is_closed = ground_truth in ['yes', 'no'] or len(ground_truth.split()) <= 2
+        if is_closed:
+            norag_cp.append(pred_norag); norag_cr.append(ground_truth)
+            rag_cp.append(pred_rag); rag_cr.append(ground_truth)
         else:
-            # Concise prompt for direct prediction
-            direct_prompt = f"Answer this medical question concisely based on the image: {question}\nAnswer:"
-            pred = shared_slm.predict(image, direct_prompt)
-            
-        if ground_truth in ['yes', 'no'] or len(ground_truth.split()) <= 2:
-            closed_preds.append(pred)
-            closed_refs.append(ground_truth)
-        else:
-            open_preds.append(pred)
-            open_refs.append(ground_truth)
-            
-    end_infer_time = time.time() # END INFERENCE TIMER
-    infer_time = round(end_infer_time - start_infer_time, 2)
-    print(f"\nInference Time: {infer_time} seconds")
+            norag_op.append(pred_norag); norag_or_.append(ground_truth)
+            rag_op.append(pred_rag); rag_or_.append(ground_truth)
     
-    return evaluator.evaluate_closed_ended(closed_preds, closed_refs), evaluator.evaluate_open_ended(open_preds, open_refs), infer_time
+    norag_time = round(norag_time, 2)
+    rag_time = round(rag_time, 2)
+    print(f"\nInference Time — No-RAG: {norag_time}s | RAG: {rag_time}s")
+    
+    return (
+        evaluator.evaluate_closed_ended(norag_cp, norag_cr),
+        evaluator.evaluate_open_ended(norag_op, norag_or_),
+        norag_time,
+        evaluator.evaluate_closed_ended(rag_cp, rag_cr),
+        evaluator.evaluate_open_ended(rag_op, rag_or_),
+        rag_time
+    )
 
 def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha):
     print(f"\nSTARTING SEPARATE FEDERATED EXPERIMENTS: {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'}")
@@ -210,7 +225,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     # 2. Build RAG Vector Databases (FAISS) - LEAKAGE FREE
     print("\n[RAG] Building Vector Databases from Training data only...")
     vqa_rad_rag_pool = vqa_rad_train
-    path_vqa_rag_pool = path_vqa_train.shuffle(seed=eval_seed+2).select(range(min(5000, len(path_vqa_train))))
+    path_vqa_rag_pool = path_vqa_train.shuffle(seed=eval_seed+2).select(range(min(1500, len(path_vqa_train))))
     
     retriever_vr = MedicalRetriever(); retriever_vr.build_index_from_dataset(vqa_rad_rag_pool)
     retriever_pv = MedicalRetriever(); retriever_pv.build_index_from_dataset(path_vqa_rag_pool)
@@ -317,13 +332,16 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     
     # Evaluate VQA-RAD
     shared_slm.model.load_state_dict(global_weights, strict=False)
-    print("\nEvaluating VQA-RAD Scenarios...")
-    vr_c_norag, vr_o_norag, vr_t_norag = evaluate_dataset(shared_slm, vqa_rad_eval, evaluator, None)
-    vr_c_rag, vr_o_rag, vr_t_rag = evaluate_dataset(shared_slm, vqa_rad_eval, evaluator, retriever_vr)
+    print("\nEvaluating VQA-RAD (No-RAG + RAG combined pass)...")
+    vr_c_norag, vr_o_norag, vr_t_norag, vr_c_rag, vr_o_rag, vr_t_rag = evaluate_dataset_combined(shared_slm, vqa_rad_eval, evaluator, retriever_vr)
     
     results_dict["Results"]["Fed-SLM (No RAG)"]["VQA-RAD"] = format_scores_for_json(vr_c_norag, vr_o_norag)
     results_dict["Results"]["Proposed (Fed+RAG)"]["VQA-RAD"] = format_scores_for_json(vr_c_rag, vr_o_rag)
     save_current_progress("VQA-RAD Experiment Completed")
+
+    # Memory cleanup between experiments
+    del clients, client_datasets_vr
+    clear_memory()
 
     # ==================== EXPERIMENT 2: PathVQA (Pathology) ====================
     print(f"\n==================== EXPERIMENT 2: PathVQA ====================")
@@ -392,9 +410,8 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     
     # Evaluate PathVQA
     shared_slm.model.load_state_dict(global_weights, strict=False)
-    print("\nEvaluating PathVQA Scenarios...")
-    pv_c_norag, pv_o_norag, pv_t_norag = evaluate_dataset(shared_slm, path_vqa_eval, evaluator, None)
-    pv_c_rag, pv_o_rag, pv_t_rag = evaluate_dataset(shared_slm, path_vqa_eval, evaluator, retriever_pv)
+    print("\nEvaluating PathVQA (No-RAG + RAG combined pass)...")
+    pv_c_norag, pv_o_norag, pv_t_norag, pv_c_rag, pv_o_rag, pv_t_rag = evaluate_dataset_combined(shared_slm, path_vqa_eval, evaluator, retriever_pv)
     
     results_dict["Results"]["Fed-SLM (No RAG)"]["PathVQA"] = format_scores_for_json(pv_c_norag, pv_o_norag)
     results_dict["Results"]["Fed-SLM (No RAG)"]["Inference_Time_Seconds"] = round(vr_t_norag + pv_t_norag, 2)

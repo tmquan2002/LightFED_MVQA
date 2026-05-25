@@ -53,26 +53,41 @@ class MedicalRetriever:
         image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
         return image_features.cpu().numpy()
 
-    def build_index_from_dataset(self, dataset):
+    def build_index_from_dataset(self, dataset, batch_size=64):
         """
-        Iterate through the entire dataset, convert images into vectors, and store them in the FAISS repository
+        Iterate through the entire dataset in batches, convert images into vectors, and store them in the FAISS repository.
+        Batched CLIP encoding for significantly faster indexing.
         """
-        print(f"[RAG Vector] Loading {len(dataset)} samples into Vector Database...")
-        embeddings = []
+        print(f"[RAG Vector] Loading {len(dataset)} samples into Vector Database (batch_size={batch_size})...")
+        all_embeddings = []
         
-        for i, sample in enumerate(dataset):
-            vector = self.get_image_embedding(sample['image'])
-            embeddings.append(vector[0])
+        for i in range(0, len(dataset), batch_size):
+            end_idx = min(i + batch_size, len(dataset))
+            batch = dataset.select(range(i, end_idx))
             
-            self.metadata.append({
-                "id": i,
-                "question": sample['question'],
-                "answer": sample['answer']
-            })
+            images = [self._preprocess_image(img) for img in batch['image']]
+            # pyrefly: ignore [unexpected-keyword]
+            inputs = self.processor(images=images, return_tensors="pt").to(self.device)
             
-        embeddings_matrix = np.array(embeddings).astype('float32')
+            with torch.no_grad():
+                features = self.model.get_image_features(**inputs)
+                features = features / features.norm(p=2, dim=-1, keepdim=True)
+            
+            all_embeddings.append(features.cpu().numpy())
+            
+            for j in range(end_idx - i):
+                self.metadata.append({
+                    "id": i + j,
+                    "question": batch['question'][j],
+                    "answer": batch['answer'][j]
+                })
+            
+            if (i // batch_size) % 5 == 0:
+                print(f"  Indexed {end_idx}/{len(dataset)} samples...", end="\r")
+            
+        embeddings_matrix = np.vstack(all_embeddings).astype('float32')
         self.index.add(embeddings_matrix)
-        print(f"[RAG Vector] Done, FAISS currently have {self.index.ntotal} vector.")
+        print(f"\n[RAG Vector] Done, FAISS currently have {self.index.ntotal} vector.")
 
     def search_similar_cases(self, query_image, c=10):
         """

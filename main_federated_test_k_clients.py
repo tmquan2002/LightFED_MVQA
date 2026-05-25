@@ -1,5 +1,7 @@
 import json
 import os
+# Fix duplicate OpenMP runtime library error on Windows/Anaconda
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import gc
 import time
 import torch
@@ -19,36 +21,101 @@ class VirtualClient:
         self.local_dataset = local_dataset
         self.lora_weights = {k: v.clone() for k, v in initial_weights.items()}
 
-    def train_local(self, shared_model, epochs=1):
+    def train_local(self, shared_slm, epochs=1, max_steps=400):
+        import torch.optim as optim
+        from qwen_vl_utils import process_vision_info
+        
         print(f"  [{self.client_id}] Training locally for {epochs} epoch(s)...")
-        shared_model.load_state_dict(self.lora_weights, strict=False)
-        shared_model.train()
+        model = shared_slm.model
+        processor = shared_slm.processor
+        device = shared_slm.device
         
-        # Simulate actual training with client-specific learning
-        import random
-        random.seed(hash(self.client_id) % 1000)  # Client-specific seed
+        model.load_state_dict(self.lora_weights, strict=False)
+        model.train()
         
-        base_loss = 0.3
-        data_size_factor = len(self.local_dataset) / 100.0  # Larger datasets learn better
-        client_factor = (hash(self.client_id) % 100) / 1000.0  # Client-specific variation
-        epoch_improvement = epochs * 0.02  # Improvement per epoch
+        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-5)
+        scaler = torch.amp.GradScaler('cuda')
+        optimizer.zero_grad()
         
-        train_loss = max(0.1, base_loss - data_size_factor - client_factor - epoch_improvement)
+        total_loss = 0.0
+        steps = 0
         
-        raw_weights = get_peft_model_state_dict(shared_model)
+        indices = list(range(len(self.local_dataset)))
+        
+        for epoch in range(epochs):
+            import random
+            random.shuffle(indices)
+            epoch_indices = indices[:max_steps]  # Cap training samples per round
+            print(f"    [{self.client_id}] Using {len(epoch_indices)}/{len(indices)} samples this round")
+            for i, idx in enumerate(epoch_indices):
+                sample = self.local_dataset[idx]
+                question = sample['question']
+                answer = str(sample['answer']).lower()
+                
+                img_obj = shared_slm._preprocess_image(sample['image'])
+                
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": img_obj},
+                            {"type": "text", "text": question},
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": answer}
+                        ]
+                    }
+                ]
+                
+                text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+                image_inputs, video_inputs = process_vision_info(messages)
+                
+                inputs = processor(
+                    text=[text],
+                    images=image_inputs,
+                    videos=video_inputs,
+                    padding=True,
+                    return_tensors="pt",
+                ).to(device)
+                
+                # Copy input_ids to labels for Causal LM loss
+                inputs['labels'] = inputs['input_ids'].clone()
+                
+                # Mixed precision forward pass with GradScaler
+                with torch.amp.autocast('cuda', dtype=torch.float16):
+                    outputs = model(**inputs)
+                    loss = outputs.loss / 4  # Gradient accumulation scale (steps=4)
+                
+                scaler.scale(loss).backward()
+                
+                if (i + 1) % 4 == 0 or (i + 1) == len(epoch_indices):
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                
+                total_loss += loss.item() * 4  # Restore original loss scale for stats
+                steps += 1
+                
+                if i % 10 == 0:
+                    print(f"    [{self.client_id}] Epoch {epoch+1}/{epochs} | Step {i}/{len(epoch_indices)} | Loss: {loss.item():.4f}   ", end="\r")
+                    
+        print()  # newline after progress
+        
+        avg_loss = total_loss / steps if steps > 0 else 0.0
+        
+        # Save updated LoRA weights
+        raw_weights = get_peft_model_state_dict(model)
         self.lora_weights = {}
         for name, param in raw_weights.items():
-            if param.device.type == 'meta':
+            if getattr(param, "device", None) and param.device.type == 'meta':
                 self.lora_weights[name] = torch.zeros(param.shape, dtype=param.dtype, device='cpu')
             else:
-                updated_param = param.clone().detach().cpu()
-                if len(updated_param.shape) > 0:  # Only modify tensor parameters
-                    noise = torch.randn_like(updated_param) * 0.001 * (hash(self.client_id) % 10)
-                    self.lora_weights[name] = updated_param + noise
-                else:
-                    self.lora_weights[name] = updated_param
+                self.lora_weights[name] = param.clone().detach().cpu()
                 
-        return self.lora_weights, train_loss
+        return self.lora_weights, avg_loss
 
 def clear_memory():
     gc.collect()
@@ -63,111 +130,79 @@ def format_scores_for_json(c_scores, o_scores):
         "ROUGE-L": round(o_scores.get('ROUGE-L', 0) * 100, 1)
     }
 
-def evaluate_dataset(shared_slm, dataset, evaluator, retriever=None):
-    shared_slm.model.eval() 
-    closed_preds, closed_refs, open_preds, open_refs = [], [], [], []
-    test_samples = dataset
-    total = len(test_samples)
+def evaluate_dataset_combined(shared_slm, dataset, evaluator, retriever):
+    """Single-pass evaluation: computes both No-RAG and RAG predictions simultaneously."""
+    shared_slm.model.eval()
+    norag_cp, norag_cr, norag_op, norag_or_ = [], [], [], []
+    rag_cp, rag_cr, rag_op, rag_or_ = [], [], [], []
+    total = len(dataset)
     
-    start_infer_time = time.time() # START INFERENCE TIMER
+    norag_time = 0.0
+    rag_time = 0.0
     
-    for i, sample in enumerate(test_samples):
+    for i, sample in enumerate(dataset):
         print(f"Evaluating: {i+1}/{total} images...", end="\r")
         question = sample['question']
         ground_truth = str(sample['answer']).lower()
         image = sample['image']
         
-        if retriever:
-            similar_cases = retriever.search_similar_cases(image, c=10)
-            context_text = "Here are some similar reference cases:\n" if similar_cases else ""
-            for j, case in enumerate(similar_cases):
-                context_text += f"- Ref {j+1}: Q: '{case['question']}' -> A: '{case['answer']}'\n"
-            augmented_question = f"{context_text}\nNow, please answer this new Question: {question}"
-            pred = shared_slm.predict(image, augmented_question)
+        # No-RAG prediction
+        t0 = time.time()
+        direct_prompt = f"Answer this medical question concisely based on the image: {question}\nAnswer:"
+        pred_norag = shared_slm.predict(image, direct_prompt)
+        norag_time += time.time() - t0
+        
+        # RAG prediction
+        t1 = time.time()
+        similar_cases = retriever.search_similar_cases(image, c=5)
+        context_text = "### Medical Reference Cases:\n" if similar_cases else ""
+        for j, case in enumerate(similar_cases):
+            context_text += f"Case {j+1}: Q: '{case['question']}' -> A: '{case['answer']}'\n"
+        augmented_question = (
+            f"{context_text}\n"
+            "### Instruction:\n"
+            "You are a medical expert. Based on the provided image and the similar reference cases above, "
+            f"answer the following question concisely.\n\n"
+            f"Question: {question}\n"
+            "Answer:"
+        )
+        pred_rag = shared_slm.predict(image, augmented_question)
+        rag_time += time.time() - t1
+        
+        # Classify into closed/open ended
+        is_closed = ground_truth in ['yes', 'no'] or len(ground_truth.split()) <= 2
+        if is_closed:
+            norag_cp.append(pred_norag); norag_cr.append(ground_truth)
+            rag_cp.append(pred_rag); rag_cr.append(ground_truth)
         else:
-            pred = shared_slm.predict(image, question)
-            
-        if ground_truth in ['yes', 'no'] or len(ground_truth.split()) <= 2:
-            closed_preds.append(pred)
-            closed_refs.append(ground_truth)
-        else:
-            open_preds.append(pred)
-            open_refs.append(ground_truth)
-            
-    end_infer_time = time.time() # END INFERENCE TIMER
-    infer_time = round(end_infer_time - start_infer_time, 2)
-    print(f"\nInference Time: {infer_time} seconds")
+            norag_op.append(pred_norag); norag_or_.append(ground_truth)
+            rag_op.append(pred_rag); rag_or_.append(ground_truth)
     
-    return evaluator.evaluate_closed_ended(closed_preds, closed_refs), evaluator.evaluate_open_ended(open_preds, open_refs), infer_time
+    norag_time = round(norag_time, 2)
+    rag_time = round(rag_time, 2)
+    print(f"\nInference Time — No-RAG: {norag_time}s | RAG: {rag_time}s")
+    
+    return (
+        evaluator.evaluate_closed_ended(norag_cp, norag_cr),
+        evaluator.evaluate_open_ended(norag_op, norag_or_),
+        norag_time,
+        evaluator.evaluate_closed_ended(rag_cp, rag_cr),
+        evaluator.evaluate_open_ended(rag_op, rag_or_),
+        rag_time
+    )
 
-def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha):
-    print(f"\nSTARTING EXPERIMENT: {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'}")
+def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
+                              shared_slm, initial_lora_weights, lora_config,
+                              vqa_rad_train, path_vqa_train,
+                              vqa_rad_eval, path_vqa_eval,
+                              retriever_vr, retriever_pv,
+                              evaluator, eval_seed):
+    print(f"\nSTARTING SEPARATE FEDERATED EXPERIMENTS: {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'}")
     
-    # Load Train and Test splits separately
-    # Load directly from Hugging Face Hub
-    vqa_rad = load_dataset("flaviagiammarino/vqa-rad")
-    path_vqa = load_dataset("flaviagiammarino/path-vqa")
-    
-    vqa_rad_train = vqa_rad["train"]
-    path_vqa_train = path_vqa["train"]
-    vqa_rad_test = vqa_rad["test"]
-    path_vqa_test = path_vqa["test"]
-    
-    # Use time-based random sampling for evaluation only
-    random.seed(int(time.time()))
-    eval_seed = random.randint(0, 1000000)
-    
-    print(f"Using random evaluation seed: {eval_seed}")
-    
-    # 1. Prepare evaluation sets (using official Test data)
-    vqa_rad_shuffled = vqa_rad_test.shuffle(seed=eval_seed)
-    path_vqa_shuffled = path_vqa_test.shuffle(seed=eval_seed+1)
-    
-    eval_size = 100
-    vqa_rad_eval = vqa_rad_shuffled.select(range(min(eval_size, len(vqa_rad_test))))
-    path_vqa_eval = path_vqa_shuffled.select(range(min(eval_size, len(path_vqa_test))))
-    
-    print(f"Evaluating with {len(vqa_rad_eval)} VQA-RAD and {len(path_vqa_eval)} PathVQA images (from official TEST set)")
-    
-    # 2. Combine BOTH datasets for training/splitting
-    from datasets import concatenate_datasets
-    combined_train = concatenate_datasets([vqa_rad_train, path_vqa_train])
-    
-    # 3. Use combined dataset for Federated Splitting
-    splitter_seed = random.randint(0, 1000000)
-    splitter = FederatedDataSplitter(combined_train, num_clients=num_clients, seed=splitter_seed)
-    print(f"Training on COMBINED dataset (VQA-RAD + PathVQA) with splitter seed: {splitter_seed}")
-    
-    if split_type == 'iid':
-        print(f"\n[1/5] Splitting data using IID for {num_clients} Hospitals...")
-        client_datasets = splitter.split_iid()
-        alpha_str = "NA"
-    else:
-        print(f"\n[1/5] Splitting data using Non-IID (alpha={alpha}) for {num_clients} Hospitals...")
-        client_datasets = splitter.split_non_iid(alpha=alpha)
-        alpha_str = str(alpha)
-
-    total_samples = sum(len(ds) for ds in client_datasets)
-    client_contributions = {
-        f"Hospital_{i+1}": round((len(ds) / total_samples) * 100, 2) 
-        for i, ds in enumerate(client_datasets)
-    }
-
-    evaluator = MedVQAEvaluator()
     server = FederatedServer()
 
-    print("\n[2/5] Building RAG Vector Database (FAISS) - LEAKAGE FREE...")
-    
-    # Build RAG pool from Training data only (Absolute zero leakage from Test set)
-    vqa_rad_rag_pool = vqa_rad_train.shuffle(seed=eval_seed+2).select(range(min(2000, len(vqa_rad_train))))
-    path_vqa_rag_pool = path_vqa_train.shuffle(seed=eval_seed+3).select(range(min(2000, len(path_vqa_train))))
-    
-    retriever_vr = MedicalRetriever(); retriever_vr.build_index_from_dataset(vqa_rad_rag_pool)
-    retriever_pv = MedicalRetriever(); retriever_pv.build_index_from_dataset(path_vqa_rag_pool)
-    
-    print(f"Built RAG index with {len(vqa_rad_rag_pool)} VQA-RAD and {len(path_vqa_rag_pool)} PathVQA images (from Train set)")
-
     os.makedirs("./data", exist_ok=True)
+    alpha_str = str(alpha) if split_type == 'non-iid' else "NA"
     file_name = f"eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}.json"
     json_path = os.path.join("./data", file_name)
     
@@ -179,13 +214,11 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
             "Split_Type": split_type.upper(),
             "Alpha": alpha if split_type == 'non-iid' else "NA"
         },
-        "Training_Stats": {
-            "Client_Data_Contributions_Percent": client_contributions,
-            "Actual_Rounds_Run": 0,
-            "Final_Average_Loss": 0.0,
-            "Training_Time_Seconds": 0.0
-        },
-        "Results": {}
+        "Training_Stats": {},
+        "Results": {
+            "Fed-SLM (No RAG)": {},
+            "Proposed (Fed+RAG)": {}
+        }
     }
 
     def save_current_progress(phase_name):
@@ -193,25 +226,26 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
             json.dump(results_dict, f, indent=4, ensure_ascii=False)
         print(f"Saved progress '{phase_name}' to: {file_name}")
 
-    print("\n>>> INITIALIZING SHARED QWEN2-VL ENGINE...")
-    shared_slm = QwenMedVQA(use_4bit=True)
-    shared_slm.model = prepare_model_for_kbit_training(shared_slm.model)
-    lora_config = LoraConfig(r=16, lora_alpha=32, target_modules=["q_proj", "v_proj"], lora_dropout=0.05, bias="none", task_type="CAUSAL_LM")
-    shared_slm.model = get_peft_model(shared_slm.model, lora_config)
+    # ==================== EXPERIMENT 1: VQA-RAD (Radiology) ====================
+    print(f"\n==================== EXPERIMENT 1: VQA-RAD ====================")
+    # Reset model parameters to base initial state
+    shared_slm.model.load_state_dict(initial_lora_weights, strict=False)
     
-    initial_lora_weights = {}
-    for k, v in get_peft_model_state_dict(shared_slm.model).items():
-        if getattr(v, "device", None) and v.device.type == 'meta':
-            initial_lora_weights[k] = torch.zeros(v.shape, dtype=v.dtype, device='cpu')
-        else:
-            initial_lora_weights[k] = v.clone().cpu()
-
-    print(f"\n[3/5] Scenario: Federated Learning (Training across {num_clients} Hospitals for {num_rounds} Rounds)")
+    splitter_seed = random.randint(0, 1000000)
+    splitter_vr = FederatedDataSplitter(vqa_rad_train, num_clients=num_clients, seed=splitter_seed)
+    
+    if split_type == 'iid':
+        client_datasets_vr = splitter_vr.split_iid()
+    else:
+        client_datasets_vr = splitter_vr.split_non_iid(alpha=alpha)
+        
+    total_samples_vr = sum(len(ds) for ds in client_datasets_vr)
+    contributions_vr = {f"Hospital_{i+1}": round((len(ds) / total_samples_vr) * 100, 2) for i, ds in enumerate(client_datasets_vr)}
     
     clients = []
     for i in range(num_clients):
-        clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets[i], initial_lora_weights))
-    
+        clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_vr[i], initial_lora_weights))
+        
     global_weights = None
     best_loss = float('inf')
     patience = 3  
@@ -219,16 +253,14 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     actual_rounds = 0
     final_loss = 0.0
 
-    start_train_time = time.time() # START TRAINING TIMER
-
+    start_train_time = time.time()
     for round_num in range(1, num_rounds + 1):
-        print(f"  -> Round {round_num}/{num_rounds}: Aggregating knowledge from {num_clients} Hospitals...")
-        
+        print(f"  [VQA-RAD] Round {round_num}/{num_rounds}: Training...")
         client_weights_list = []
         client_losses = []
         
         for client in clients:
-            weights, loss = client.train_local(shared_slm.model, epochs=epochs)
+            weights, loss = client.train_local(shared_slm, epochs=epochs)
             client_weights_list.append(weights)
             client_losses.append(loss)
             
@@ -240,56 +272,119 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
         avg_loss = sum(client_losses) / len(client_losses)
         final_loss = avg_loss
         actual_rounds = round_num
-        print(f"Average Loss: {avg_loss:.4f}")
+        print(f"  [VQA-RAD] Round {round_num} Avg Loss: {avg_loss:.4f}")
         
         if avg_loss < best_loss - 0.001:
             best_loss = avg_loss
             patience_counter = 0
-            print(f"Loss improved. Continuing training...")
         else:
             patience_counter += 1
-            print(f"Loss did not improve. Patience: {patience_counter}/{patience}")
             if patience_counter >= patience:
-                print(f"EARLY STOPPING TRIGGERED! Model converged at round {round_num}.")
+                print(f"  [VQA-RAD] Early stopping triggered.")
                 break
                 
-    end_train_time = time.time() # END TRAINING TIMER
-    total_train_time = round(end_train_time - start_train_time, 2)
-    print(f"\nTotal Training Time: {total_train_time} seconds")
-
-    results_dict["Training_Stats"]["Actual_Rounds_Run"] = actual_rounds
-    results_dict["Training_Stats"]["Final_Average_Loss"] = round(final_loss, 4)
-    results_dict["Training_Stats"]["Training_Time_Seconds"] = total_train_time
-    save_current_progress("Training Completed")
-
+    total_train_time_vr = round(time.time() - start_train_time, 2)
+    results_dict["Training_Stats"]["VQA-RAD"] = {
+        "Client_Data_Contributions_Percent": contributions_vr,
+        "Actual_Rounds_Run": actual_rounds,
+        "Final_Average_Loss": round(final_loss, 4),
+        "Training_Time_Seconds": total_train_time_vr
+    }
+    
+    # Evaluate VQA-RAD
     shared_slm.model.load_state_dict(global_weights, strict=False)
+    print("\nEvaluating VQA-RAD (No-RAG + RAG combined pass)...")
+    vr_c_norag, vr_o_norag, vr_t_norag, vr_c_rag, vr_o_rag, vr_t_rag = evaluate_dataset_combined(shared_slm, vqa_rad_eval, evaluator, retriever_vr)
     
-    print("\n[4/5] Scenario: Fed-SLM (No RAG)")
-    vr_c, vr_o, vr_t = evaluate_dataset(shared_slm, vqa_rad_eval, evaluator, None)
-    pv_c, pv_o, pv_t = evaluate_dataset(shared_slm, path_vqa_eval, evaluator, None)
-    results_dict["Results"]["Fed-SLM (No RAG)"] = {
-        "VQA-RAD": format_scores_for_json(vr_c, vr_o), 
-        "PathVQA": format_scores_for_json(pv_c, pv_o),
-        "Inference_Time_Seconds": round(vr_t + pv_t, 2)
-    }
-    save_current_progress("Fed-SLM (No RAG)")
+    results_dict["Results"]["Fed-SLM (No RAG)"]["VQA-RAD"] = format_scores_for_json(vr_c_norag, vr_o_norag)
+    results_dict["Results"]["Proposed (Fed+RAG)"]["VQA-RAD"] = format_scores_for_json(vr_c_rag, vr_o_rag)
+    save_current_progress("VQA-RAD Experiment Completed")
 
-    print("\n[5/5] Scenario: Proposed (Fed + RAG)")
-    vr_c, vr_o, vr_t_rag = evaluate_dataset(shared_slm, vqa_rad_eval, evaluator, retriever_vr)
-    pv_c, pv_o, pv_t_rag = evaluate_dataset(shared_slm, path_vqa_eval, evaluator, retriever_pv)
-    results_dict["Results"]["Proposed (Fed+RAG)"] = {
-        "VQA-RAD": format_scores_for_json(vr_c, vr_o), 
-        "PathVQA": format_scores_for_json(pv_c, pv_o),
-        "Inference_Time_Seconds": round(vr_t_rag + pv_t_rag, 2)
-    }
-    save_current_progress("Proposed (Fed+RAG)")
+    # Memory cleanup between experiments
+    del clients, client_datasets_vr
+    clear_memory()
 
-    print(f"\nCOMPLETED for {num_clients} clients! Metrics saved to: {json_path}")
+    # ==================== EXPERIMENT 2: PathVQA (Pathology) ====================
+    print(f"\n==================== EXPERIMENT 2: PathVQA ====================")
+    # Reset model parameters to base initial state
+    shared_slm.model.load_state_dict(initial_lora_weights, strict=False)
     
+    splitter_seed_pv = random.randint(0, 1000000)
+    splitter_pv = FederatedDataSplitter(path_vqa_train, num_clients=num_clients, seed=splitter_seed_pv)
+    
+    if split_type == 'iid':
+        client_datasets_pv = splitter_pv.split_iid()
+    else:
+        client_datasets_pv = splitter_pv.split_non_iid(alpha=alpha)
+        
+    total_samples_pv = sum(len(ds) for ds in client_datasets_pv)
+    contributions_pv = {f"Hospital_{i+1}": round((len(ds) / total_samples_pv) * 100, 2) for i, ds in enumerate(client_datasets_pv)}
+    
+    clients = []
+    for i in range(num_clients):
+        clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_pv[i], initial_lora_weights))
+        
+    global_weights = None
+    best_loss = float('inf')
+    patience = 3  
+    patience_counter = 0
+    actual_rounds = 0
+    final_loss = 0.0
+
+    start_train_time = time.time()
+    for round_num in range(1, num_rounds + 1):
+        print(f"  [PathVQA] Round {round_num}/{num_rounds}: Training...")
+        client_weights_list = []
+        client_losses = []
+        
+        for client in clients:
+            weights, loss = client.train_local(shared_slm, epochs=epochs)
+            client_weights_list.append(weights)
+            client_losses.append(loss)
+            
+        client_sizes = [len(c.local_dataset) for c in clients]
+        global_weights = server.aggregate_weights(client_weights_list, client_sizes=client_sizes)
+        for client in clients:
+            client.lora_weights = {k: v.clone() for k, v in global_weights.items()}
+            
+        avg_loss = sum(client_losses) / len(client_losses)
+        final_loss = avg_loss
+        actual_rounds = round_num
+        print(f"  [PathVQA] Round {round_num} Avg Loss: {avg_loss:.4f}")
+        
+        if avg_loss < best_loss - 0.001:
+            best_loss = avg_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"  [PathVQA] Early stopping triggered.")
+                break
+                
+    total_train_time_pv = round(time.time() - start_train_time, 2)
+    results_dict["Training_Stats"]["PathVQA"] = {
+        "Client_Data_Contributions_Percent": contributions_pv,
+        "Actual_Rounds_Run": actual_rounds,
+        "Final_Average_Loss": round(final_loss, 4),
+        "Training_Time_Seconds": total_train_time_pv
+    }
+    
+    # Evaluate PathVQA
+    shared_slm.model.load_state_dict(global_weights, strict=False)
+    print("\nEvaluating PathVQA (No-RAG + RAG combined pass)...")
+    pv_c_norag, pv_o_norag, pv_t_norag, pv_c_rag, pv_o_rag, pv_t_rag = evaluate_dataset_combined(shared_slm, path_vqa_eval, evaluator, retriever_pv)
+    
+    results_dict["Results"]["Fed-SLM (No RAG)"]["PathVQA"] = format_scores_for_json(pv_c_norag, pv_o_norag)
+    results_dict["Results"]["Fed-SLM (No RAG)"]["Inference_Time_Seconds"] = round(vr_t_norag + pv_t_norag, 2)
+    
+    results_dict["Results"]["Proposed (Fed+RAG)"]["PathVQA"] = format_scores_for_json(pv_c_rag, pv_o_rag)
+    results_dict["Results"]["Proposed (Fed+RAG)"]["Inference_Time_Seconds"] = round(vr_t_rag + pv_t_rag, 2)
+    
+    save_current_progress("All Experiments Completed")
+    print(f"\nCOMPLETED for K={num_clients} clients! Metrics saved to: {json_path}")
+
     # Cleanup memory for next iteration
-    del shared_slm
-    del retriever_vr
-    del retriever_pv
+    del clients, client_datasets_pv
     clear_memory()
 
 def get_user_setup_no_k():
@@ -330,11 +425,67 @@ if __name__ == "__main__":
     print("--- FEDERATED SIMULATION: LOOPING CLIENTS K (2 to 5) ---")
     rounds_input, epochs_input, split_input, alpha_input = get_user_setup_no_k()
     
+    # Load datasets ONCE
+    vqa_rad = load_dataset("flaviagiammarino/vqa-rad")
+    path_vqa = load_dataset("flaviagiammarino/path-vqa")
+    
+    vqa_rad_train = vqa_rad["train"]
+    path_vqa_train = path_vqa["train"]
+    vqa_rad_test = vqa_rad["test"]
+    path_vqa_test = path_vqa["test"]
+    
+    # Use time-based random sampling for evaluation
+    random.seed(int(time.time()))
+    eval_seed = random.randint(0, 1000000)
+    
+    print(f"Using random evaluation seed: {eval_seed}")
+    
+    # Prepare evaluation sets (from official Test splits)
+    vqa_rad_shuffled = vqa_rad_test.shuffle(seed=eval_seed)
+    path_vqa_shuffled = path_vqa_test.shuffle(seed=eval_seed+1)
+    
+    eval_size = 100
+    vqa_rad_eval = vqa_rad_shuffled.select(range(min(eval_size, len(vqa_rad_test))))
+    path_vqa_eval = path_vqa_shuffled.select(range(min(eval_size, len(path_vqa_test))))
+    
+    print(f"Evaluating with {len(vqa_rad_eval)} VQA-RAD and {len(path_vqa_eval)} PathVQA images (from official TEST set)")
+    
+    evaluator = MedVQAEvaluator()
+
+    # Build RAG Vector Databases (FAISS) - LEAKAGE FREE
+    print("\n[RAG] Building Vector Databases from Training data only...")
+    vqa_rad_rag_pool = vqa_rad_train
+    path_vqa_rag_pool = path_vqa_train.shuffle(seed=eval_seed+2).select(range(min(1500, len(path_vqa_train))))
+    
+    retriever_vr = MedicalRetriever(); retriever_vr.build_index_from_dataset(vqa_rad_rag_pool)
+    retriever_pv = MedicalRetriever(); retriever_pv.build_index_from_dataset(path_vqa_rag_pool)
+
+    # Initialize shared model ONCE
+    print("\n>>> INITIALIZING SHARED QWEN2-VL ENGINE...")
+    shared_slm = QwenMedVQA(use_4bit=True)
+    shared_slm.model = prepare_model_for_kbit_training(shared_slm.model)
+    lora_config = LoraConfig(r=16, lora_alpha=32, target_modules=["q_proj", "v_proj"], lora_dropout=0.05, bias="none", task_type="CAUSAL_LM")
+    shared_slm.model = get_peft_model(shared_slm.model, lora_config)
+    
+    initial_lora_weights = {}
+    for k, v in get_peft_model_state_dict(shared_slm.model).items():
+        if getattr(v, "device", None) and v.device.type == 'meta':
+            initial_lora_weights[k] = torch.zeros(v.shape, dtype=v.dtype, device='cpu')
+        else:
+            initial_lora_weights[k] = v.clone().cpu()
+
     for k in range(2, 6):
         print(f"\n" + "="*50)
         print(f"RUNNING SIMULATION FOR K = {k} CLIENTS")
         print("="*50)
-        run_federated_simulation(k, rounds_input, epochs_input, split_input, alpha_input)
+        run_federated_simulation(
+            k, rounds_input, epochs_input, split_input, alpha_input,
+            shared_slm, initial_lora_weights, lora_config,
+            vqa_rad_train, path_vqa_train,
+            vqa_rad_eval, path_vqa_eval,
+            retriever_vr, retriever_pv,
+            evaluator, eval_seed
+        )
         
     print("\n" + "="*50)
     print("ALL SIMULATIONS COMPLETED!")
