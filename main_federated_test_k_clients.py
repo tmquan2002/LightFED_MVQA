@@ -241,7 +241,8 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
         
     total_samples_vr = sum(len(ds) for ds in client_datasets_vr)
     contributions_vr = {f"Hospital_{i+1}": round((len(ds) / total_samples_vr) * 100, 2) for i, ds in enumerate(client_datasets_vr)}
-       os.makedirs("./model_checkpoints", exist_ok=True)
+    
+    os.makedirs("./model_checkpoints", exist_ok=True)
     alpha_str = str(alpha) if split_type == 'non-iid' else "NA"
     checkpoint_vr = f"./model_checkpoints/lora_vr_{num_clients}clients_{num_rounds}rounds_{epochs}epochs_{split_type}_a{alpha_str}.pt"
 
@@ -359,7 +360,8 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
         
     total_samples_pv = sum(len(ds) for ds in client_datasets_pv)
     contributions_pv = {f"Hospital_{i+1}": round((len(ds) / total_samples_pv) * 100, 2) for i, ds in enumerate(client_datasets_pv)}
-       checkpoint_pv = f"./model_checkpoints/lora_pv_{num_clients}clients_{num_rounds}rounds_{epochs}epochs_{split_type}_a{alpha_str}.pt"
+    
+    checkpoint_pv = f"./model_checkpoints/lora_pv_{num_clients}clients_{num_rounds}rounds_{epochs}epochs_{split_type}_a{alpha_str}.pt"
 
     global_weights = None
     start_round = 1
