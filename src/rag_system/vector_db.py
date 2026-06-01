@@ -71,6 +71,15 @@ class MedicalRetriever:
             
             with torch.no_grad():
                 features = self.model.get_image_features(**inputs)
+                
+                if not isinstance(features, torch.Tensor):
+                    if hasattr(features, 'pooler_output'):
+                        features = features.pooler_output
+                    elif hasattr(features, 'image_embeds'):
+                        features = features.image_embeds
+                    else:
+                        features = features.last_hidden_state[:, 0, :]
+                
                 features = features / features.norm(p=2, dim=-1, keepdim=True)
             
             all_embeddings.append(features.cpu().numpy())
