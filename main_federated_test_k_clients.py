@@ -21,7 +21,7 @@ class VirtualClient:
         self.local_dataset = local_dataset
         self.lora_weights = {k: v.clone() for k, v in initial_weights.items()}
 
-    def train_local(self, shared_slm, epochs=1, max_steps=400):
+    def train_local(self, shared_slm, epochs=1, max_steps=100):
         import torch.optim as optim
         from qwen_vl_utils import process_vision_info
         
@@ -241,53 +241,91 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
         
     total_samples_vr = sum(len(ds) for ds in client_datasets_vr)
     contributions_vr = {f"Hospital_{i+1}": round((len(ds) / total_samples_vr) * 100, 2) for i, ds in enumerate(client_datasets_vr)}
-    
-    clients = []
-    for i in range(num_clients):
-        clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_vr[i], initial_lora_weights))
-        
+       os.makedirs("./model_checkpoints", exist_ok=True)
+    alpha_str = str(alpha) if split_type == 'non-iid' else "NA"
+    checkpoint_vr = f"./model_checkpoints/lora_vr_{num_clients}clients_{num_rounds}rounds_{epochs}epochs_{split_type}_a{alpha_str}.pt"
+
     global_weights = None
+    start_round = 1
     best_loss = float('inf')
-    patience = 3  
+    patience = 3
     patience_counter = 0
     actual_rounds = 0
     final_loss = 0.0
-
+    total_train_time_vr = 0.0
     start_train_time = time.time()
-    for round_num in range(1, num_rounds + 1):
-        print(f"  [VQA-RAD] Round {round_num}/{num_rounds}: Training...")
-        client_weights_list = []
-        client_losses = []
+
+    if os.path.exists(checkpoint_vr):
+        print(f"\n[LOAD] Found existing trained weights checkpoint for VQA-RAD: {checkpoint_vr}")
+        checkpoint = torch.load(checkpoint_vr, map_location='cpu')
         
-        for client in clients:
-            weights, loss = client.train_local(shared_slm, epochs=epochs)
-            client_weights_list.append(weights)
-            client_losses.append(loss)
-            
-        client_sizes = [len(c.local_dataset) for c in clients]
-        global_weights = server.aggregate_weights(client_weights_list, client_sizes=client_sizes)
-        for client in clients:
-            client.lora_weights = {k: v.clone() for k, v in global_weights.items()}
-            
-        avg_loss = sum(client_losses) / len(client_losses)
-        final_loss = avg_loss
-        actual_rounds = round_num
-        print(f"  [VQA-RAD] Round {round_num} Avg Loss: {avg_loss:.4f}")
-        
-        if avg_loss < best_loss - 0.001:
-            best_loss = avg_loss
-            patience_counter = 0
+        if isinstance(checkpoint, dict) and 'weights' in checkpoint:
+            global_weights = checkpoint['weights']
+            start_round = checkpoint.get('round', num_rounds) + 1
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            patience_counter = checkpoint.get('patience_counter', 0)
         else:
-            patience_counter += 1
+            global_weights = checkpoint
+            start_round = num_rounds + 1
+            
+        if start_round > num_rounds:
+            print("Loading saved weights and skipping training...")
+            actual_rounds = "Loaded from checkpoint"
+            final_loss = best_loss if best_loss != float('inf') else 0.0
+        else:
+            print(f"Resuming training from Round {start_round}...")
+
+    clients = []
+    if start_round <= num_rounds:
+        for i in range(num_clients):
+            initial_client_weights = global_weights if global_weights is not None else initial_lora_weights
+            clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_vr[i], initial_client_weights))
+            
+        for round_num in range(start_round, num_rounds + 1):
+            print(f"  [VQA-RAD] Round {round_num}/{num_rounds}: Training...")
+            client_weights_list = []
+            client_losses = []
+            
+            for client in clients:
+                weights, loss = client.train_local(shared_slm, epochs=epochs, max_steps=100)
+                client_weights_list.append(weights)
+                client_losses.append(loss)
+                
+            client_sizes = [len(c.local_dataset) for c in clients]
+            global_weights = server.aggregate_weights(client_weights_list, client_sizes=client_sizes)
+            for client in clients:
+                client.lora_weights = {k: v.clone() for k, v in global_weights.items()}
+                
+            avg_loss = sum(client_losses) / len(client_losses)
+            final_loss = avg_loss
+            actual_rounds = round_num
+            print(f"  [VQA-RAD] Round {round_num} Avg Loss: {avg_loss:.4f}")
+            
+            if avg_loss < best_loss - 0.001:
+                best_loss = avg_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                
+            # AUTO-SAVE checkpoint every round
+            torch.save({
+                'round': round_num,
+                'weights': global_weights,
+                'best_loss': best_loss,
+                'patience_counter': patience_counter
+            }, checkpoint_vr)
+            print(f"  [VQA-RAD] Auto-saved Round {round_num} checkpoint.")
+
             if patience_counter >= patience:
                 print(f"  [VQA-RAD] Early stopping triggered.")
                 break
                 
-    total_train_time_vr = round(time.time() - start_train_time, 2)
+        total_train_time_vr = round(time.time() - start_train_time, 2)
+        
     results_dict["Training_Stats"]["VQA-RAD"] = {
         "Client_Data_Contributions_Percent": contributions_vr,
         "Actual_Rounds_Run": actual_rounds,
-        "Final_Average_Loss": round(final_loss, 4),
+        "Final_Average_Loss": round(final_loss, 4) if isinstance(final_loss, (int, float)) else final_loss,
         "Training_Time_Seconds": total_train_time_vr
     }
     
@@ -301,7 +339,9 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     save_current_progress("VQA-RAD Experiment Completed")
 
     # Memory cleanup between experiments
-    del clients, client_datasets_vr
+    if 'clients' in locals():
+        del clients
+    del client_datasets_vr
     clear_memory()
 
     # ==================== EXPERIMENT 2: PathVQA (Pathology) ====================
@@ -319,53 +359,89 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
         
     total_samples_pv = sum(len(ds) for ds in client_datasets_pv)
     contributions_pv = {f"Hospital_{i+1}": round((len(ds) / total_samples_pv) * 100, 2) for i, ds in enumerate(client_datasets_pv)}
-    
-    clients = []
-    for i in range(num_clients):
-        clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_pv[i], initial_lora_weights))
-        
+       checkpoint_pv = f"./model_checkpoints/lora_pv_{num_clients}clients_{num_rounds}rounds_{epochs}epochs_{split_type}_a{alpha_str}.pt"
+
     global_weights = None
+    start_round = 1
     best_loss = float('inf')
-    patience = 3  
+    patience = 3
     patience_counter = 0
     actual_rounds = 0
     final_loss = 0.0
-
+    total_train_time_pv = 0.0
     start_train_time = time.time()
-    for round_num in range(1, num_rounds + 1):
-        print(f"  [PathVQA] Round {round_num}/{num_rounds}: Training...")
-        client_weights_list = []
-        client_losses = []
+
+    if os.path.exists(checkpoint_pv):
+        print(f"\n[LOAD] Found existing trained weights checkpoint for PathVQA: {checkpoint_pv}")
+        checkpoint = torch.load(checkpoint_pv, map_location='cpu')
         
-        for client in clients:
-            weights, loss = client.train_local(shared_slm, epochs=epochs)
-            client_weights_list.append(weights)
-            client_losses.append(loss)
-            
-        client_sizes = [len(c.local_dataset) for c in clients]
-        global_weights = server.aggregate_weights(client_weights_list, client_sizes=client_sizes)
-        for client in clients:
-            client.lora_weights = {k: v.clone() for k, v in global_weights.items()}
-            
-        avg_loss = sum(client_losses) / len(client_losses)
-        final_loss = avg_loss
-        actual_rounds = round_num
-        print(f"  [PathVQA] Round {round_num} Avg Loss: {avg_loss:.4f}")
-        
-        if avg_loss < best_loss - 0.001:
-            best_loss = avg_loss
-            patience_counter = 0
+        if isinstance(checkpoint, dict) and 'weights' in checkpoint:
+            global_weights = checkpoint['weights']
+            start_round = checkpoint.get('round', num_rounds) + 1
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            patience_counter = checkpoint.get('patience_counter', 0)
         else:
-            patience_counter += 1
+            global_weights = checkpoint
+            start_round = num_rounds + 1
+            
+        if start_round > num_rounds:
+            print("Loading saved weights and skipping training...")
+            actual_rounds = "Loaded from checkpoint"
+            final_loss = best_loss if best_loss != float('inf') else 0.0
+        else:
+            print(f"Resuming training from Round {start_round}...")
+
+    clients = []
+    if start_round <= num_rounds:
+        for i in range(num_clients):
+            initial_client_weights = global_weights if global_weights is not None else initial_lora_weights
+            clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_pv[i], initial_client_weights))
+            
+        for round_num in range(start_round, num_rounds + 1):
+            print(f"  [PathVQA] Round {round_num}/{num_rounds}: Training...")
+            client_weights_list = []
+            client_losses = []
+            
+            for client in clients:
+                weights, loss = client.train_local(shared_slm, epochs=epochs, max_steps=100)
+                client_weights_list.append(weights)
+                client_losses.append(loss)
+                
+            client_sizes = [len(c.local_dataset) for c in clients]
+            global_weights = server.aggregate_weights(client_weights_list, client_sizes=client_sizes)
+            for client in clients:
+                client.lora_weights = {k: v.clone() for k, v in global_weights.items()}
+                
+            avg_loss = sum(client_losses) / len(client_losses)
+            final_loss = avg_loss
+            actual_rounds = round_num
+            print(f"  [PathVQA] Round {round_num} Avg Loss: {avg_loss:.4f}")
+            
+            if avg_loss < best_loss - 0.001:
+                best_loss = avg_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                
+            # AUTO-SAVE checkpoint every round
+            torch.save({
+                'round': round_num,
+                'weights': global_weights,
+                'best_loss': best_loss,
+                'patience_counter': patience_counter
+            }, checkpoint_pv)
+            print(f"  [PathVQA] Auto-saved Round {round_num} checkpoint.")
+
             if patience_counter >= patience:
                 print(f"  [PathVQA] Early stopping triggered.")
                 break
                 
-    total_train_time_pv = round(time.time() - start_train_time, 2)
+        total_train_time_pv = round(time.time() - start_train_time, 2)
+        
     results_dict["Training_Stats"]["PathVQA"] = {
         "Client_Data_Contributions_Percent": contributions_pv,
         "Actual_Rounds_Run": actual_rounds,
-        "Final_Average_Loss": round(final_loss, 4),
+        "Final_Average_Loss": round(final_loss, 4) if isinstance(final_loss, (int, float)) else final_loss,
         "Training_Time_Seconds": total_train_time_pv
     }
     
@@ -384,7 +460,9 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     print(f"\nCOMPLETED for K={num_clients} clients! Metrics saved to: {json_path}")
 
     # Cleanup memory for next iteration
-    del clients, client_datasets_pv
+    if 'clients' in locals():
+        del clients
+    del client_datasets_pv
     clear_memory()
 
 def get_user_setup_no_k():
@@ -400,7 +478,7 @@ def get_user_setup_no_k():
 
     while True:
         try:
-            epochs = int(input("2. Enter local Epochs for each Hospital (e.g., 1, 3, 5): "))
+            epochs = int(input("2. Enter local Epochs for each Hospital (e.g., 1, 2, 3 - 1 is recommended for speed/stability): "))
             if epochs >= 1: break
             else: print("At least 1 epoch is required!")
         except ValueError: print("Please enter a valid integer!")
@@ -444,7 +522,7 @@ if __name__ == "__main__":
     vqa_rad_shuffled = vqa_rad_test.shuffle(seed=eval_seed)
     path_vqa_shuffled = path_vqa_test.shuffle(seed=eval_seed+1)
     
-    eval_size = 100
+    eval_size = 50
     vqa_rad_eval = vqa_rad_shuffled.select(range(min(eval_size, len(vqa_rad_test))))
     path_vqa_eval = path_vqa_shuffled.select(range(min(eval_size, len(path_vqa_test))))
     

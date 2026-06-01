@@ -286,32 +286,48 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     checkpoint_vr = f"./model_checkpoints/lora_vr_{num_clients}clients_{num_rounds}rounds_{epochs}epochs_{split_type}_a{alpha_str}.pt"
 
     global_weights = None
+    start_round = 1
+    best_loss = float('inf')
+    patience = 3
+    patience_counter = 0
+    actual_rounds = 0
+    final_loss = 0.0
+    total_train_time_vr = 0.0
+    start_train_time = time.time()
+
     if os.path.exists(checkpoint_vr):
         print(f"\n[LOAD] Found existing trained weights checkpoint for VQA-RAD: {checkpoint_vr}")
-        print("Loading saved weights and skipping training...")
-        global_weights = torch.load(checkpoint_vr, map_location='cpu')
-        actual_rounds = "Loaded from checkpoint"
-        final_loss = 0.0
-        total_train_time_vr = 0.0
-    else:
-        clients = []
-        for i in range(num_clients):
-            clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_vr[i], initial_lora_weights))
+        checkpoint = torch.load(checkpoint_vr, map_location='cpu')
+        
+        if isinstance(checkpoint, dict) and 'weights' in checkpoint:
+            global_weights = checkpoint['weights']
+            start_round = checkpoint.get('round', num_rounds) + 1
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            patience_counter = checkpoint.get('patience_counter', 0)
+        else:
+            global_weights = checkpoint
+            start_round = num_rounds + 1
             
-        best_loss = float('inf')
-        patience = 3  
-        patience_counter = 0
-        actual_rounds = 0
-        final_loss = 0.0
+        if start_round > num_rounds:
+            print("Loading saved weights and skipping training...")
+            actual_rounds = "Loaded from checkpoint"
+            final_loss = best_loss if best_loss != float('inf') else 0.0
+        else:
+            print(f"Resuming training from Round {start_round}...")
 
-        start_train_time = time.time()
-        for round_num in range(1, num_rounds + 1):
+    clients = []
+    if start_round <= num_rounds:
+        for i in range(num_clients):
+            initial_client_weights = global_weights if global_weights is not None else initial_lora_weights
+            clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_vr[i], initial_client_weights))
+            
+        for round_num in range(start_round, num_rounds + 1):
             print(f"  [VQA-RAD] Round {round_num}/{num_rounds}: Training...")
             client_weights_list = []
             client_losses = []
             
             for client in clients:
-                weights, loss = client.train_local(shared_slm, epochs=epochs)
+                weights, loss = client.train_local(shared_slm, epochs=epochs, max_steps=100)
                 client_weights_list.append(weights)
                 client_losses.append(loss)
                 
@@ -330,13 +346,21 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
                 patience_counter = 0
             else:
                 patience_counter += 1
-                if patience_counter >= patience:
-                    print(f"  [VQA-RAD] Early stopping triggered.")
-                    break
-                    
+                
+            # AUTO-SAVE checkpoint every round
+            torch.save({
+                'round': round_num,
+                'weights': global_weights,
+                'best_loss': best_loss,
+                'patience_counter': patience_counter
+            }, checkpoint_vr)
+            print(f"  [VQA-RAD] Auto-saved Round {round_num} checkpoint.")
+
+            if patience_counter >= patience:
+                print(f"  [VQA-RAD] Early stopping triggered.")
+                break
+                
         total_train_time_vr = round(time.time() - start_train_time, 2)
-        torch.save(global_weights, checkpoint_vr)
-        print(f"[SAVE] Trained VQA-RAD weights saved to: {checkpoint_vr}")
         
     results_dict["Training_Stats"]["VQA-RAD"] = {
         "Client_Data_Contributions_Percent": contributions_vr,
@@ -379,32 +403,48 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     checkpoint_pv = f"./model_checkpoints/lora_pv_{num_clients}clients_{num_rounds}rounds_{epochs}epochs_{split_type}_a{alpha_str}.pt"
 
     global_weights = None
+    start_round = 1
+    best_loss = float('inf')
+    patience = 3
+    patience_counter = 0
+    actual_rounds = 0
+    final_loss = 0.0
+    total_train_time_pv = 0.0
+    start_train_time = time.time()
+
     if os.path.exists(checkpoint_pv):
         print(f"\n[LOAD] Found existing trained weights checkpoint for PathVQA: {checkpoint_pv}")
-        print("Loading saved weights and skipping training...")
-        global_weights = torch.load(checkpoint_pv, map_location='cpu')
-        actual_rounds = "Loaded from checkpoint"
-        final_loss = 0.0
-        total_train_time_pv = 0.0
-    else:
-        clients = []
-        for i in range(num_clients):
-            clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_pv[i], initial_lora_weights))
+        checkpoint = torch.load(checkpoint_pv, map_location='cpu')
+        
+        if isinstance(checkpoint, dict) and 'weights' in checkpoint:
+            global_weights = checkpoint['weights']
+            start_round = checkpoint.get('round', num_rounds) + 1
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            patience_counter = checkpoint.get('patience_counter', 0)
+        else:
+            global_weights = checkpoint
+            start_round = num_rounds + 1
             
-        best_loss = float('inf')
-        patience = 3  
-        patience_counter = 0
-        actual_rounds = 0
-        final_loss = 0.0
+        if start_round > num_rounds:
+            print("Loading saved weights and skipping training...")
+            actual_rounds = "Loaded from checkpoint"
+            final_loss = best_loss if best_loss != float('inf') else 0.0
+        else:
+            print(f"Resuming training from Round {start_round}...")
 
-        start_train_time = time.time()
-        for round_num in range(1, num_rounds + 1):
+    clients = []
+    if start_round <= num_rounds:
+        for i in range(num_clients):
+            initial_client_weights = global_weights if global_weights is not None else initial_lora_weights
+            clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_pv[i], initial_client_weights))
+            
+        for round_num in range(start_round, num_rounds + 1):
             print(f"  [PathVQA] Round {round_num}/{num_rounds}: Training...")
             client_weights_list = []
             client_losses = []
             
             for client in clients:
-                weights, loss = client.train_local(shared_slm, epochs=epochs)
+                weights, loss = client.train_local(shared_slm, epochs=epochs, max_steps=100)
                 client_weights_list.append(weights)
                 client_losses.append(loss)
                 
@@ -423,13 +463,21 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
                 patience_counter = 0
             else:
                 patience_counter += 1
-                if patience_counter >= patience:
-                    print(f"  [PathVQA] Early stopping triggered.")
-                    break
-                    
+                
+            # AUTO-SAVE checkpoint every round
+            torch.save({
+                'round': round_num,
+                'weights': global_weights,
+                'best_loss': best_loss,
+                'patience_counter': patience_counter
+            }, checkpoint_pv)
+            print(f"  [PathVQA] Auto-saved Round {round_num} checkpoint.")
+
+            if patience_counter >= patience:
+                print(f"  [PathVQA] Early stopping triggered.")
+                break
+                
         total_train_time_pv = round(time.time() - start_train_time, 2)
-        torch.save(global_weights, checkpoint_pv)
-        print(f"[SAVE] Trained PathVQA weights saved to: {checkpoint_pv}")
         
     results_dict["Training_Stats"]["PathVQA"] = {
         "Client_Data_Contributions_Percent": contributions_pv,
