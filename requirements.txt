@@ -18,6 +18,8 @@ av
 faiss-cpu
 scikit-learn
 numpy>=1.24.0,<2.0.0
+open-clip-torch
+timm
 
 # Utilities
 datasets

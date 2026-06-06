@@ -83,12 +83,8 @@ def evaluate_dataset(shared_llm, dataset, evaluator, retriever=None):
         image = sample['image']
         
         if retriever:
-            similar_cases = retriever.search_similar_cases(image, c=10)
-            context_text = "Here are some similar reference cases:\n" if similar_cases else ""
-            for j, case in enumerate(similar_cases):
-                context_text += f"- Ref {j+1}: Q: '{case['question']}' -> A: '{case['answer']}'\n"
-            augmented_question = f"{context_text}\nNow, please answer this new Question: {question}"
-            pred = shared_llm.predict(image, augmented_question)
+            similar_cases = retriever.search_similar_cases(image, query_question=question, c=3)
+            pred = shared_llm.predict(image, question, retrieved_cases=similar_cases)
         else:
             pred = shared_llm.predict(image, question)
             
@@ -144,7 +140,6 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     splitter = FederatedDataSplitter(combined_train, num_clients=num_clients, seed=splitter_seed)
     print(f"Training on COMBINED dataset (VQA-RAD + PathVQA) with splitter seed: {splitter_seed}")
     print(f"Using splitter seed: {splitter_seed}")
-
     if split_type == 'iid':
         print(f"\n[1/4] Splitting data using IID for {num_clients} Hospitals...")
         client_datasets = splitter.split_iid()
@@ -163,16 +158,16 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     evaluator = MedVQAEvaluator()
     server = FederatedServer()
 
-    print("\n[2/4] Building RAG Vector Database (FAISS)...")
-    # Use subset for RAG to avoid memory issues but still more than before
-    # Build RAG pool from Training data only
-    vqa_rad_rag_pool = vqa_rad_train.shuffle(seed=eval_seed+2).select(range(min(2000, len(vqa_rad_train))))
-    path_vqa_rag_pool = path_vqa_train.shuffle(seed=eval_seed+3).select(range(min(2000, len(path_vqa_train))))
+    print("\n[2/4] Loading or Building RAG Vector Databases (FAISS) - LEAKAGE FREE...")
+    retriever_vr = MedicalRetriever("vqarad")
+    retriever_vr.train_dataset = vqa_rad_train
+    retriever_vr.build_index_from_dataset(vqa_rad_train)
     
-    retriever_vr = MedicalRetriever(); retriever_vr.build_index_from_dataset(vqa_rad_rag_pool)
-    retriever_pv = MedicalRetriever(); retriever_pv.build_index_from_dataset(path_vqa_rag_pool)
+    retriever_pv = MedicalRetriever("pathvqa")
+    retriever_pv.train_dataset = path_vqa_train
+    retriever_pv.build_index_from_dataset(path_vqa_train)
     
-    print(f"Built RAG index with {len(vqa_rad_rag_pool)} VQA-RAD and {len(path_vqa_rag_pool)} PathVQA images")
+    print(f"Built RAG index with {len(vqa_rad_train)} VQA-RAD and {len(path_vqa_train)} PathVQA images")
 
     os.makedirs("./data", exist_ok=True)
     file_name = f"LLM_Qwen_eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}.json"
