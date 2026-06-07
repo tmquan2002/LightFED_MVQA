@@ -82,31 +82,35 @@ class QwenMedVQA:
                 pil_img.thumbnail((max_res, max_res), Image.Resampling.LANCZOS)
                 return pil_img
                 
+            messages = []
             for i, case in enumerate(retrieved_cases):
                 try:
-                    if 'image' in case:
-                        ref_img = self._preprocess_image(case['image'])
-                        ref_img = optimize_img(ref_img)
-                        content_block.append({"type": "image", "image": ref_img})
-                    evidence_text = f"{i+1}. Case Reference: Question \"{case['question']}\" resulted in Answer \"{case['answer']}\".\n"
-                    content_block.append({"type": "text", "text": evidence_text})
+                    ref_img = self._preprocess_image(case['image'])
+                    ref_img = optimize_img(ref_img)
+                    messages.append({
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": ref_img},
+                            {"type": "text", "text": f"Reference Case {i+1}:\nQuestion: {case['question']}"}
+                        ]
+                    })
+                    messages.append({
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": f"Answer: {case['answer']}"}
+                        ]
+                    })
                 except Exception:
                     continue
-                    
-            content_block.append({"type": "text", "text": "\n[Target Case Image]\n"})
+            
             target_img = optimize_img(target_img)
-            content_block.append({"type": "image", "image": target_img})
-            
-            target_instruction = (
-                f"\nCurrent Question: {question}\n\n"
-                "Based on the visual evidence and the clinical context provided above, what is the correct answer for the current case?\n"
-                "</User>\n\n"
-                "<Assistant>\n"
-                "Final Answer: "
-            )
-            content_block.append({"type": "text", "text": target_instruction})
-            
-            messages = [{"role": "user", "content": content_block}]
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": target_img},
+                    {"type": "text", "text": f"Current Question: {question}\nBased on the reference cases above, what is the correct answer for the current case? Answer concisely."}
+                ]
+            })
         else:
             # Fallback to direct direct VQA prompt
             messages = [
@@ -120,7 +124,7 @@ class QwenMedVQA:
             ]
             
         text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True if not retrieved_cases else False
+            messages, tokenize=False, add_generation_prompt=True
         )
         image_inputs, video_inputs = process_vision_info(messages)
         

@@ -81,8 +81,20 @@ class VirtualClient:
                     return_tensors="pt",
                 ).to(device)
                 
-                # Copy input_ids to labels for Causal LM loss
-                inputs['labels'] = inputs['input_ids'].clone()
+                # Copy input_ids to labels and mask out prompt tokens (set to -100)
+                prompt_text = processor.apply_chat_template([messages[0]], tokenize=False, add_generation_prompt=True)
+                prompt_inputs = processor(
+                    text=[prompt_text],
+                    images=image_inputs,
+                    videos=video_inputs,
+                    padding=True,
+                    return_tensors="pt",
+                )
+                prompt_len = prompt_inputs['input_ids'].shape[1]
+                
+                labels = inputs['input_ids'].clone()
+                labels[:, :prompt_len] = -100
+                inputs['labels'] = labels
                 
                 # Mixed precision forward pass with GradScaler
                 with torch.amp.autocast('cuda', dtype=torch.float16):
