@@ -15,11 +15,17 @@ from src.models.qwen_slm import QwenMedVQA
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, get_peft_model_state_dict
 
 class VirtualClient:
-    """Virtual Hospital: Holds Data and personal LoRA weights"""
-    def __init__(self, client_id, local_dataset, initial_weights):
+    """Virtual Hospital: Holds Data, personal LoRA weights, and local RAG retriever"""
+    def __init__(self, client_id, local_dataset, initial_weights, dataset_name):
         self.client_id = client_id
         self.local_dataset = local_dataset
         self.lora_weights = {k: v.clone() for k, v in initial_weights.items()}
+        
+        # Initialize local retriever for leak-free RAG training
+        print(f"  [{self.client_id}] Initializing local retriever indexing {len(local_dataset)} samples...")
+        self.retriever = MedicalRetriever(f"{dataset_name}_{client_id}")
+        self.retriever.train_dataset = local_dataset
+        self.retriever.build_index_from_dataset(local_dataset)
 
     def train_local(self, shared_slm, epochs=1, max_steps=100):
         import torch.optim as optim
@@ -34,7 +40,7 @@ class VirtualClient:
         model.train()
         
         optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-5)
-        scaler = torch.amp.GradScaler('cuda')
+        scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
         optimizer.zero_grad()
         
         total_loss = 0.0
@@ -42,8 +48,15 @@ class VirtualClient:
         
         indices = list(range(len(self.local_dataset)))
         
+        # Helper to resize/optimize images to avoid VRAM/RAM overload
+        def optimize_img(pil_img, max_res=336):
+            from PIL import Image
+            if pil_img.mode != "RGB":
+                pil_img = pil_img.convert("RGB")
+            pil_img.thumbnail((max_res, max_res), Image.Resampling.LANCZOS)
+            return pil_img
+
         for epoch in range(epochs):
-            import random
             random.shuffle(indices)
             epoch_indices = indices[:max_steps]  # Cap training samples per round
             print(f"    [{self.client_id}] Using {len(epoch_indices)}/{len(indices)} samples this round")
@@ -52,23 +65,47 @@ class VirtualClient:
                 question = sample['question']
                 answer = str(sample['answer']).lower()
                 
-                img_obj = shared_slm._preprocess_image(sample['image'])
+                # Dynamic retrieval: query local retriever for Top-4 cases (excluding query itself)
+                retrieved = self.retriever.search_similar_cases(sample['image'], query_question=question, c=4)
+                similar_cases = [case for case in retrieved if case['id'] != idx][:3]
                 
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": img_obj},
-                            {"type": "text", "text": question},
-                        ],
-                    },
-                    {
-                        "role": "assistant",
-                        "content": [
-                            {"type": "text", "text": answer}
-                        ]
-                    }
-                ]
+                # Format prompts exactly using the multi-turn RAG template
+                messages = []
+                for j, case in enumerate(similar_cases):
+                    try:
+                        ref_img = shared_slm._preprocess_image(case['image'])
+                        ref_img = optimize_img(ref_img)
+                        messages.append({
+                            "role": "user",
+                            "content": [
+                                {"type": "image", "image": ref_img},
+                                {"type": "text", "text": f"Reference Case {j+1}:\nQuestion: {case['question']}"}
+                            ]
+                        })
+                        messages.append({
+                            "role": "assistant",
+                            "content": [
+                                {"type": "text", "text": f"Answer: {case['answer']}"}
+                            ]
+                        })
+                    except Exception:
+                        continue
+                
+                target_img = shared_slm._preprocess_image(sample['image'])
+                target_img = optimize_img(target_img)
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": target_img},
+                        {"type": "text", "text": f"Current Question: {question}\nBased on the reference cases above, what is the correct answer for the current case? Answer concisely."}
+                    ]
+                })
+                messages.append({
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": answer}
+                    ]
+                })
                 
                 text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
                 image_inputs, video_inputs = process_vision_info(messages)
@@ -82,7 +119,7 @@ class VirtualClient:
                 ).to(device)
                 
                 # Copy input_ids to labels and mask out prompt tokens (set to -100)
-                prompt_text = processor.apply_chat_template([messages[0]], tokenize=False, add_generation_prompt=True)
+                prompt_text = processor.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True)
                 prompt_inputs = processor(
                     text=[prompt_text],
                     images=image_inputs,
@@ -97,16 +134,24 @@ class VirtualClient:
                 inputs['labels'] = labels
                 
                 # Mixed precision forward pass with GradScaler
-                with torch.amp.autocast('cuda', dtype=torch.float16):
+                if scaler is not None:
+                    with torch.amp.autocast('cuda', dtype=torch.float16):
+                        outputs = model(**inputs)
+                        loss = outputs.loss / 4  # Gradient accumulation scale (steps=4)
+                    scaler.scale(loss).backward()
+                    
+                    if (i + 1) % 4 == 0 or (i + 1) == len(epoch_indices):
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
+                else:
                     outputs = model(**inputs)
-                    loss = outputs.loss / 4  # Gradient accumulation scale (steps=4)
-                
-                scaler.scale(loss).backward()
-                
-                if (i + 1) % 4 == 0 or (i + 1) == len(epoch_indices):
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
+                    loss = outputs.loss / 4
+                    loss.backward()
+                    
+                    if (i + 1) % 4 == 0 or (i + 1) == len(epoch_indices):
+                        optimizer.step()
+                        optimizer.zero_grad()
                 
                 total_loss += loss.item() * 4  # Restore original loss scale for stats
                 steps += 1
@@ -142,62 +187,36 @@ def format_scores_for_json(c_scores, o_scores):
         "ROUGE-L": round(o_scores.get('ROUGE-L', 0) * 100, 1)
     }
 
-def evaluate_dataset_combined(shared_slm, dataset, evaluator, retriever):
-    """Single-pass evaluation: computes both No-RAG and RAG predictions simultaneously."""
+def evaluate_dataset(shared_slm, dataset, evaluator, retriever):
     shared_slm.model.eval()
-    norag_cp, norag_cr, norag_op, norag_or_ = [], [], [], []
-    rag_cp, rag_cr, rag_op, rag_or_ = [], [], [], []
+    closed_preds, closed_refs, open_preds, open_refs = [], [], [], []
     total = len(dataset)
-    
-    norag_time = 0.0
-    rag_time = 0.0
+    start_infer_time = time.time()
     
     for i, sample in enumerate(dataset):
-        print(f"Evaluating: {i+1}/{total} images...", end="\r")
+        print(f"    Evaluating: {i+1}/{total} images...", end="\r")
         question = sample['question']
         ground_truth = str(sample['answer']).lower()
         image = sample['image']
         
-        # No-RAG prediction
-        t0 = time.time()
-        direct_prompt = f"Answer this medical question concisely based on the image: {question}\nAnswer:"
-        pred_norag = shared_slm.predict(image, direct_prompt)
-        norag_time += time.time() - t0
-        
         # RAG prediction
-        t1 = time.time()
-        # Query using both image AND text query (Top-3 cases like instructor's notebook)
         similar_cases = retriever.search_similar_cases(image, query_question=question, c=3)
-        pred_rag = shared_slm.predict(image, question, retrieved_cases=similar_cases)
-        rag_time += time.time() - t1
+        pred = shared_slm.predict(image, question, retrieved_cases=similar_cases)
         
-        # Classify into closed/open ended
         is_closed = ground_truth in ['yes', 'no'] or len(ground_truth.split()) <= 2
         if is_closed:
-            norag_cp.append(pred_norag); norag_cr.append(ground_truth)
-            rag_cp.append(pred_rag); rag_cr.append(ground_truth)
+            closed_preds.append(pred); closed_refs.append(ground_truth)
         else:
-            norag_op.append(pred_norag); norag_or_.append(ground_truth)
-            rag_op.append(pred_rag); rag_or_.append(ground_truth)
+            open_preds.append(pred); open_refs.append(ground_truth)
+            
+    infer_time = round(time.time() - start_infer_time, 2)
+    print(f"\nInference Time: {infer_time} seconds")
     
-    norag_time = round(norag_time, 2)
-    rag_time = round(rag_time, 2)
-    print(f"\nInference Time — No-RAG: {norag_time}s | RAG: {rag_time}s")
-    
-    return (
-        evaluator.evaluate_closed_ended(norag_cp, norag_cr),
-        evaluator.evaluate_open_ended(norag_op, norag_or_),
-        norag_time,
-        evaluator.evaluate_closed_ended(rag_cp, rag_cr),
-        evaluator.evaluate_open_ended(rag_op, rag_or_),
-        rag_time
-    )
-
+    return evaluator.evaluate_closed_ended(closed_preds, closed_refs), evaluator.evaluate_open_ended(open_preds, open_refs), infer_time
 
 def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha):
-    print(f"\nSTARTING SEPARATE FEDERATED EXPERIMENTS: {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'}")
+    print(f"\nSTARTING SEPARATE FEDERATED EXPERIMENTS (WITH RAG): {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'}")
     
-    # Load datasets
     vqa_rad = load_dataset("flaviagiammarino/vqa-rad")
     path_vqa = load_dataset("flaviagiammarino/path-vqa")
     
@@ -209,10 +228,8 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     # Use time-based random sampling for evaluation
     random.seed(int(time.time()))
     eval_seed = random.randint(0, 1000000)
-    
     print(f"Using random evaluation seed: {eval_seed}")
     
-    # 1. Prepare evaluation sets (from official Test splits)
     vqa_rad_shuffled = vqa_rad_test.shuffle(seed=eval_seed)
     path_vqa_shuffled = path_vqa_test.shuffle(seed=eval_seed+1)
     
@@ -225,7 +242,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     evaluator = MedVQAEvaluator()
     server = FederatedServer()
 
-    # 2. Build/Load RAG Vector Databases (FAISS) - LEAKAGE FREE
+    # Build/Load RAG Vector Databases (FAISS) for global evaluation
     print("\n[RAG] Loading or Building Vector Databases from Training data only...")
     retriever_vr = MedicalRetriever("vqarad")
     retriever_vr.train_dataset = vqa_rad_train
@@ -246,11 +263,11 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
             "Max_Rounds_Configured": num_rounds,
             "Local_Epochs": epochs,
             "Split_Type": split_type.upper(),
-            "Alpha": alpha if split_type == 'non-iid' else "NA"
+            "Alpha": alpha if split_type == 'non-iid' else "NA",
+            "Model_Type": "Federated Learning with RAG"
         },
         "Training_Stats": {},
         "Results": {
-            "Fed-SLM (No RAG)": {},
             "Proposed (Fed+RAG)": {}
         }
     }
@@ -273,7 +290,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
         else:
             initial_lora_weights[k] = v.clone().cpu()
 
-    # ==================== EXPERIMENT 1: VQA-RAD (Radiology) ====================
+    # ==================== EXPERIMENT 1: VQA-RAD ====================
     print(f"\n==================== EXPERIMENT 1: VQA-RAD ====================")
     splitter_seed = random.randint(0, 1000000)
     splitter_vr = FederatedDataSplitter(vqa_rad_train, num_clients=num_clients, seed=splitter_seed)
@@ -287,7 +304,6 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     contributions_vr = {f"Hospital_{i+1}": round((len(ds) / total_samples_vr) * 100, 2) for i, ds in enumerate(client_datasets_vr)}
     
     os.makedirs("./model_checkpoints", exist_ok=True)
-    alpha_str = str(alpha) if split_type == 'non-iid' else "NA"
     checkpoint_vr = f"./model_checkpoints/lora_vr_{num_clients}clients_{num_rounds}rounds_{epochs}epochs_{split_type}_a{alpha_str}.pt"
 
     global_weights = None
@@ -303,7 +319,6 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     if os.path.exists(checkpoint_vr):
         print(f"\n[LOAD] Found existing trained weights checkpoint for VQA-RAD: {checkpoint_vr}")
         checkpoint = torch.load(checkpoint_vr, map_location='cpu')
-        
         if isinstance(checkpoint, dict) and 'weights' in checkpoint:
             global_weights = checkpoint['weights']
             start_round = checkpoint.get('round', num_rounds) + 1
@@ -324,7 +339,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     if start_round <= num_rounds:
         for i in range(num_clients):
             initial_client_weights = global_weights if global_weights is not None else initial_lora_weights
-            clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_vr[i], initial_client_weights))
+            clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_vr[i], initial_client_weights, "vqarad"))
             
         for round_num in range(start_round, num_rounds + 1):
             print(f"  [VQA-RAD] Round {round_num}/{num_rounds}: Training...")
@@ -376,20 +391,19 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     
     # Evaluate VQA-RAD
     shared_slm.model.load_state_dict(global_weights, strict=False)
-    print("\nEvaluating VQA-RAD (No-RAG + RAG combined pass)...")
-    vr_c_norag, vr_o_norag, vr_t_norag, vr_c_rag, vr_o_rag, vr_t_rag = evaluate_dataset_combined(shared_slm, vqa_rad_eval, evaluator, retriever_vr)
+    print("\nEvaluating VQA-RAD (Proposed Fed+RAG)...")
+    vr_c, vr_o, vr_t = evaluate_dataset(shared_slm, vqa_rad_eval, evaluator, retriever_vr)
     
-    results_dict["Results"]["Fed-SLM (No RAG)"]["VQA-RAD"] = format_scores_for_json(vr_c_norag, vr_o_norag)
-    results_dict["Results"]["Proposed (Fed+RAG)"]["VQA-RAD"] = format_scores_for_json(vr_c_rag, vr_o_rag)
+    results_dict["Results"]["Proposed (Fed+RAG)"]["VQA-RAD"] = format_scores_for_json(vr_c, vr_o)
     save_current_progress("VQA-RAD Experiment Completed")
 
-    # Memory cleanup between experiments
+    # Memory cleanup
     if 'clients' in locals():
         del clients
     del client_datasets_vr
     clear_memory()
 
-    # ==================== EXPERIMENT 2: PathVQA (Pathology) ====================
+    # ==================== EXPERIMENT 2: PathVQA ====================
     print(f"\n==================== EXPERIMENT 2: PathVQA ====================")
     # Reset model parameters to base initial state
     shared_slm.model.load_state_dict(initial_lora_weights, strict=False)
@@ -420,7 +434,6 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     if os.path.exists(checkpoint_pv):
         print(f"\n[LOAD] Found existing trained weights checkpoint for PathVQA: {checkpoint_pv}")
         checkpoint = torch.load(checkpoint_pv, map_location='cpu')
-        
         if isinstance(checkpoint, dict) and 'weights' in checkpoint:
             global_weights = checkpoint['weights']
             start_round = checkpoint.get('round', num_rounds) + 1
@@ -441,7 +454,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     if start_round <= num_rounds:
         for i in range(num_clients):
             initial_client_weights = global_weights if global_weights is not None else initial_lora_weights
-            clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_pv[i], initial_client_weights))
+            clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_pv[i], initial_client_weights, "pathvqa"))
             
         for round_num in range(start_round, num_rounds + 1):
             print(f"  [PathVQA] Round {round_num}/{num_rounds}: Training...")
@@ -493,26 +506,20 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha)
     
     # Evaluate PathVQA
     shared_slm.model.load_state_dict(global_weights, strict=False)
-    print("\nEvaluating PathVQA (No-RAG + RAG combined pass)...")
-    pv_c_norag, pv_o_norag, pv_t_norag, pv_c_rag, pv_o_rag, pv_t_rag = evaluate_dataset_combined(shared_slm, path_vqa_eval, evaluator, retriever_pv)
+    print("\nEvaluating PathVQA (Proposed Fed+RAG)...")
+    pv_c, pv_o, pv_t = evaluate_dataset(shared_slm, path_vqa_eval, evaluator, retriever_pv)
     
-    results_dict["Results"]["Fed-SLM (No RAG)"]["PathVQA"] = format_scores_for_json(pv_c_norag, pv_o_norag)
-    results_dict["Results"]["Fed-SLM (No RAG)"]["Inference_Time_Seconds"] = round(vr_t_norag + pv_t_norag, 2)
-    
-    results_dict["Results"]["Proposed (Fed+RAG)"]["PathVQA"] = format_scores_for_json(pv_c_rag, pv_o_rag)
-    results_dict["Results"]["Proposed (Fed+RAG)"]["Inference_Time_Seconds"] = round(vr_t_rag + pv_t_rag, 2)
-    
+    results_dict["Results"]["Proposed (Fed+RAG)"]["PathVQA"] = format_scores_for_json(pv_c, pv_o)
+    results_dict["Results"]["Proposed (Fed+RAG)"]["Inference_Time_Seconds"] = round(vr_t + pv_t, 2)
     save_current_progress("All Experiments Completed")
-    print(f"\nCOMPLETED! Evaluation metrics securely saved to: {json_path}")
+    print(f"\nCOMPLETED! Evaluation metrics saved to: {json_path}")
 
-    # Cleanup memory for next iteration
     if 'clients' in locals():
         del clients
     del client_datasets_pv
     clear_memory()
 
 def get_user_setup():
-    
     while True:
         try:
             num_clients = int(input("\n1. Enter the number of participating Hospitals (e.g., 2, 3, 5): "))
@@ -545,7 +552,7 @@ def get_user_setup():
             try:
                 alpha = float(input("5. Enter Alpha coefficient (e.g., 0.1 for extreme non-IID, 0.5 for moderate): "))
                 if alpha > 0: break
-                else: print("lpha must be greater than 0!")
+                else: print("Alpha must be greater than 0!")
             except ValueError: print("Please enter a valid float number!")
 
     return num_clients, num_rounds, epochs, split_type, alpha
