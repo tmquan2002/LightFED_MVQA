@@ -180,8 +180,6 @@ def clear_memory():
         torch.cuda.empty_cache()
 
 def format_scores_for_json(c_scores, o_scores, question_type="all"):
-    # If training on open-ended questions, we evaluate Accuracy (closed-ended test set)
-    # If training on closed-ended (Yes-No) questions, we evaluate GA (open-ended test set)
     accuracy = round(c_scores.get('Accuracy', 0) * 100, 1) if question_type in ["all", "open"] else 0.0
     f1 = round(c_scores.get('F1-Score', 0) * 100, 1) if question_type in ["all", "open"] else 0.0
     bleu = round(o_scores.get('BLEU', 0) * 100, 1) if question_type in ["all", "closed"] else 0.0
@@ -205,10 +203,8 @@ def evaluate_dataset(shared_slm, dataset, evaluator, retriever, question_type="a
         ground_truth = str(sample['answer']).lower()
         image = sample['image']
         
-        is_closed = ground_truth in ['yes', 'no'] or len(ground_truth.split()) <= 2
-        # For accuracy, only train on open ended questions, while GA train on Yes-No questions:
-        # - If training on open-ended questions (question_type == "open"), we evaluate accuracy on closed-ended (Yes-No) questions, so skip open-ended evaluation queries.
-        # - If training on closed-ended questions (question_type == "closed"), we evaluate GA on open-ended questions, so skip closed-ended evaluation queries.
+        is_closed = FederatedDataSplitter.is_closed_ended(ground_truth)
+        
         if question_type == "open" and not is_closed:
             continue
         elif question_type == "closed" and is_closed:
@@ -261,7 +257,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     
     os.makedirs("./data", exist_ok=True)
     alpha_str = str(alpha) if split_type == 'non-iid' else "NA"
-    file_name = f"eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}.json"
+    file_name = f"eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}_optB.json"
     json_path = os.path.join("./data", file_name)
     
     results_dict = {
@@ -271,7 +267,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
             "Local_Epochs": epochs,
             "Split_Type": split_type.upper(),
             "Alpha": alpha if split_type == 'non-iid' else "NA",
-            "Model_Type": "Federated Learning with RAG"
+            "Model_Type": "Federated Learning with RAG (Hospital Question Type Split)"
         },
         "Training_Stats": {},
         "Results": {
@@ -315,17 +311,22 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     shared_slm.model.load_state_dict(initial_lora_weights, strict=False)
     
     splitter_seed_pv = random.randint(0, 1000000)
-    splitter_pv = FederatedDataSplitter(path_vqa_train, num_clients=num_clients, seed=splitter_seed_pv, question_type=question_type, max_samples=max_samples)
+    
+    # If split_type is 'type-split', ensure we don't pre-filter the splitter to 'closed' or 'open' exclusively
+    effective_qtype = "all" if split_type == "type-split" else question_type
+    splitter_pv = FederatedDataSplitter(path_vqa_train, num_clients=num_clients, seed=splitter_seed_pv, question_type=effective_qtype, max_samples=max_samples)
     
     if split_type == 'iid':
         client_datasets_pv = splitter_pv.split_iid()
-    else:
+    elif split_type == 'non-iid':
         client_datasets_pv = splitter_pv.split_non_iid(alpha=alpha)
+    else:
+        client_datasets_pv = splitter_pv.split_by_question_type()
         
     total_samples_pv = sum(len(ds) for ds in client_datasets_pv)
     contributions_pv = {f"Hospital_{i+1}": round((len(ds) / total_samples_pv) * 100, 2) for i, ds in enumerate(client_datasets_pv)}
     
-    checkpoint_pv = f"./model_checkpoints/lora_pv_{num_clients}clients_{num_rounds}rounds_{epochs}epochs_{split_type}_a{alpha_str}.pt"
+    checkpoint_pv = f"./model_checkpoints/lora_pv_{num_clients}clients_{num_rounds}rounds_{epochs}epochs_{split_type}_a{alpha_str}_optB.pt"
 
     global_weights = None
     start_round = 1
@@ -448,9 +449,9 @@ def get_user_setup():
         except ValueError: print("Please enter a valid integer!")
 
     while True:
-        split_type = input("4. Select data splitting mode ('iid' or 'non-iid'): ").strip().lower()
-        if split_type in ['iid', 'non-iid']: break
-        else: print("Only 'iid' or 'non-iid' are accepted!")
+        split_type = input("4. Select data splitting mode ('iid', 'non-iid', or 'type-split'): ").strip().lower()
+        if split_type in ['iid', 'non-iid', 'type-split']: break
+        else: print("Only 'iid', 'non-iid', or 'type-split' are accepted!")
 
     alpha = 0.5 
     if split_type == 'non-iid':

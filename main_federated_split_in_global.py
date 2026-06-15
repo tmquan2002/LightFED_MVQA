@@ -205,7 +205,9 @@ def evaluate_dataset(shared_slm, dataset, evaluator, retriever, question_type="a
         ground_truth = str(sample['answer']).lower()
         image = sample['image']
         
-        is_closed = ground_truth in ['yes', 'no'] or len(ground_truth.split()) <= 2
+        # Option A: Use the unified helper function from FederatedDataSplitter
+        is_closed = FederatedDataSplitter.is_closed_ended(ground_truth)
+        
         # For accuracy, only train on open ended questions, while GA train on Yes-No questions:
         # - If training on open-ended questions (question_type == "open"), we evaluate accuracy on closed-ended (Yes-No) questions, so skip open-ended evaluation queries.
         # - If training on closed-ended questions (question_type == "closed"), we evaluate GA on open-ended questions, so skip closed-ended evaluation queries.
@@ -261,7 +263,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     
     os.makedirs("./data", exist_ok=True)
     alpha_str = str(alpha) if split_type == 'non-iid' else "NA"
-    file_name = f"eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}.json"
+    file_name = f"eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}_optA.json"
     json_path = os.path.join("./data", file_name)
     
     results_dict = {
@@ -271,7 +273,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
             "Local_Epochs": epochs,
             "Split_Type": split_type.upper(),
             "Alpha": alpha if split_type == 'non-iid' else "NA",
-            "Model_Type": "Federated Learning with RAG"
+            "Model_Type": "Federated Learning with RAG (Unified Check)"
         },
         "Training_Stats": {},
         "Results": {
@@ -325,7 +327,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     total_samples_pv = sum(len(ds) for ds in client_datasets_pv)
     contributions_pv = {f"Hospital_{i+1}": round((len(ds) / total_samples_pv) * 100, 2) for i, ds in enumerate(client_datasets_pv)}
     
-    checkpoint_pv = f"./model_checkpoints/lora_pv_{num_clients}clients_{num_rounds}rounds_{epochs}epochs_{split_type}_a{alpha_str}.pt"
+    checkpoint_pv = f"./model_checkpoints/lora_pv_{num_clients}clients_{num_rounds}rounds_{epochs}epochs_{split_type}_a{alpha_str}_optA.pt"
 
     global_weights = None
     start_round = 1

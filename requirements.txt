@@ -1,10 +1,10 @@
-# PyTorch CUDA 12.1 index (ensures GPU support on Windows instead of CPU-only)
---extra-index-url https://download.pytorch.org/whl/cu121
+--index-url https://download.pytorch.org/whl/cu121
+--extra-index-url https://pypi.org/simple
 
 # Deep Learning Core
-torch>=2.6.0
-torchvision
-torchaudio
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
 
 # Multimodal & LLM/SLM
 transformers>=4.48.0

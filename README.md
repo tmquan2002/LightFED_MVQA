@@ -41,14 +41,14 @@ venv\Scripts\activate
 
 ```
 
-- Install PyTorch (Version ```>= 2.6.0``` is strictly required to patch the HuggingFace ```torch.load``` vulnerability)
+- Install PyTorch with CUDA 12.1 Support (Version ```>= 2.6.0``` is strictly required to patch the HuggingFace ```torch.load``` vulnerability)
 
 ```bash
-pip install --upgrade "torch>=2.6.0" torchvision torchaudio
+pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu121
 ```
 - Install core dependencies
 ```bash
-pip install transformers datasets peft accelerate bitsandbytes qwen-vl-utils faiss-cpu scikit-learn pillow numpy
+pip install -r requirements.txt
 ```
 
 ## Usage
