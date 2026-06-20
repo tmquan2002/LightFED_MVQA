@@ -56,18 +56,25 @@ class VirtualClient:
             pil_img.thumbnail((max_res, max_res), Image.Resampling.LANCZOS)
             return pil_img
 
+        # Pre-compute RAG cases to avoid I/O bottleneck
+        print(f"    [{self.client_id}] Pre-computing RAG retrievals to avoid I/O bottleneck...")
+        rag_cache = {}
+        for idx in range(len(self.local_dataset)):
+            sample = self.local_dataset[idx]
+            retrieved = self.retriever.search_similar_cases(sample['image'], query_question=sample['question'], c=4)
+            rag_cache[idx] = [case for case in retrieved if case['id'] != idx][:3]
+
         for epoch in range(epochs):
             random.shuffle(indices)
-            epoch_indices = indices[:max_steps]  # Cap training samples per round
+            epoch_indices = indices  # Cap training samples per round removed
             print(f"    [{self.client_id}] Using {len(epoch_indices)}/{len(indices)} samples this round")
             for i, idx in enumerate(epoch_indices):
                 sample = self.local_dataset[idx]
                 question = sample['question']
                 answer = str(sample['answer']).lower()
                 
-                # Dynamic retrieval: query local retriever for Top-4 cases (excluding query itself)
-                retrieved = self.retriever.search_similar_cases(sample['image'], query_question=question, c=4)
-                similar_cases = [case for case in retrieved if case['id'] != idx][:3]
+                # Use pre-computed retrieved cases
+                similar_cases = rag_cache[idx]
                 
                 # Format prompts exactly using the multi-turn RAG template
                 messages = []
@@ -137,23 +144,24 @@ class VirtualClient:
                 if scaler is not None:
                     with torch.amp.autocast('cuda', dtype=torch.float16):
                         outputs = model(**inputs)
-                        loss = outputs.loss / 4  # Gradient accumulation scale (steps=4)
+                        loss = outputs.loss / 16  # Gradient accumulation scale (steps=16)
                     scaler.scale(loss).backward()
                     
-                    if (i + 1) % 4 == 0 or (i + 1) == len(epoch_indices):
+                    accumulation_steps = 16
+                    if (i + 1) % accumulation_steps == 0 or (i + 1) == len(epoch_indices):
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad()
                 else:
                     outputs = model(**inputs)
-                    loss = outputs.loss / 4
+                    loss = outputs.loss / 16
                     loss.backward()
                     
-                    if (i + 1) % 4 == 0 or (i + 1) == len(epoch_indices):
+                    if (i + 1) % 16 == 0 or (i + 1) == len(epoch_indices):
                         optimizer.step()
                         optimizer.zero_grad()
                 
-                total_loss += loss.item() * 4  # Restore original loss scale for stats
+                total_loss += loss.item() * 16  # Restore original loss scale for stats
                 steps += 1
                 
                 if i % 10 == 0:
@@ -206,12 +214,10 @@ def evaluate_dataset(shared_slm, dataset, evaluator, retriever, question_type="a
         image = sample['image']
         
         is_closed = ground_truth in ['yes', 'no'] or len(ground_truth.split()) <= 2
-        # For accuracy, only train on open ended questions, while GA train on Yes-No questions:
-        # - If training on open-ended questions (question_type == "open"), we evaluate accuracy on closed-ended (Yes-No) questions, so skip open-ended evaluation queries.
-        # - If training on closed-ended questions (question_type == "closed"), we evaluate GA on open-ended questions, so skip closed-ended evaluation queries.
-        if question_type == "open" and not is_closed:
+        
+        if question_type == "open" and is_closed:
             continue
-        elif question_type == "closed" and is_closed:
+        elif question_type == "closed" and not is_closed:
             continue
             
         # RAG prediction
