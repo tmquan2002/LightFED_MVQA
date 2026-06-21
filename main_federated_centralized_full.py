@@ -63,6 +63,9 @@ class MedVQAEvaluator:
         pass
 
     def evaluate_closed_ended(self, preds, refs):
+        if not preds or not refs:
+            return {"Accuracy": 0.0, "F1-Score": 0.0}
+
         cleaned_preds = [str(p).lower().strip() for p in preds]
         cleaned_refs = [str(r).lower().strip() for r in refs]
 
