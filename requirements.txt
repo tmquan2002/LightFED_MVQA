@@ -28,3 +28,7 @@ matplotlib
 jupyter
 tqdm
 wandb
+
+# Evaluation Metrics
+nltk
+rouge-score

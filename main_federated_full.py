@@ -101,6 +101,35 @@ class FederatedDataSplitter:
         for i, ds in enumerate(client_datasets):
             print(f"Hospital {i+1} receives: {len(ds)} photos.")
         return client_datasets
+    def build_prompt(question, retrieved_cases):
+        # 1. Format the retrieved knowledge
+        context_str = ""
+        for i, case in enumerate(retrieved_cases):
+            context_str += f"Case {i+1}:\nQ: {case['question']}\nA: {case['answer']}\n\n    "
+
+        # 2. Construct the prompt
+        prompt = (
+            "You are an expert medical AI. Your task is to extract the exact answer from the retrieved knowledge.\n"
+            "Strict Rules:\n"
+            "1. Answer the question as concisely as possible (usually 1-5 words).\n"
+            "2. Do NOT use full sentences. Do NOT add phrases like 'The answer is' or 'Based on the context'.\n"
+            "3. Output ONLY the medical term or 'yes'/'no'.\n\n"
+            f"Retrieved Knowledge:\n{context_str}\n"
+            f"Current Question:\n{question}\n\n"
+            "Answer:\n"
+        )
+        return prompt
+    def clean_generated_answer(raw_answer):
+        ans = str(raw_answer).lower().strip()
+        # Remove common redundant phrases
+        stopwords = [
+            "the answer is", "based on the reference cases,", 
+            "based on the retrieved knowledge,", "it is", "located in"
+        ]
+        for stopword in stopwords:
+            ans = ans.replace(stopword, "")
+        # Remove punctuation at the beginning/end of the string
+        return ans.strip().strip(".:,")
 
 # --- src/federated/server.py ---
 class FederatedServer:
