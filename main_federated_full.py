@@ -110,13 +110,21 @@ class FederatedDataSplitter:
         # 2. Construct the prompt
         prompt = (
             "You are an expert medical AI. Your task is to extract the exact answer from the retrieved knowledge.\n"
-            "Strict Rules:\n"
-            "1. Answer the question as concisely as possible (usually 1-5 words).\n"
-            "2. Do NOT use full sentences. Do NOT add phrases like 'The answer is' or 'Based on the context'.\n"
-            "3. Output ONLY the medical term or 'yes'/'no'.\n\n"
-            f"Retrieved Knowledge:\n{context_str}\n"
-            f"Current Question:\n{question}\n\n"
-            "Answer:\n"
+            "Instruction:\n"
+            "You must adapt your reasoning based on the question type.\n\n"
+            "- If the question is CLOSED-ENDED (Yes/No only):\n"
+            "  • The final answer MUST be \"yes\" or \"no\"\n"
+            "  • Focus primarily on the image\n"
+            "  • Use retrieved QA cases only if they strongly match the visual evidence\n\n"
+            "- If the question is OPEN-ENDED:\n"
+            "  • Use both the image and retrieved QA cases\n"
+            "  • Combine visual evidence with similar QA examples to improve reasoning and completeness\n\n"
+            "General rules:\n"
+            "- Retrieved cases are ranked by similarity score (higher score = more relevant)\n"
+            "- Ignore low-score or irrelevant retrieved cases\n"
+            "- Do not output reasoning steps\n"
+            "- Output only the final answer\n\n"
+            "Answer:\n" 
         )
         return prompt
     def clean_generated_answer(raw_answer):
@@ -433,10 +441,10 @@ def clear_memory():
         torch.cuda.empty_cache()
 
 def format_scores_for_json(c_scores, o_scores, question_type="all"):
-    accuracy = round(c_scores.get('Accuracy', 0) * 100, 1) if question_type in ["all", "open"] else 0.0
-    f1 = round(c_scores.get('F1-Score', 0) * 100, 1) if question_type in ["all", "open"] else 0.0
-    bleu = round(o_scores.get('BLEU', 0) * 100, 1) if question_type in ["all", "closed"] else 0.0
-    rouge = round(o_scores.get('ROUGE-L', 0) * 100, 1) if question_type in ["all", "closed"] else 0.0
+    accuracy = round(c_scores.get('Accuracy', 0) * 100, 1) if question_type in ["all", "closed"] else 0.0
+    f1 = round(c_scores.get('F1-Score', 0) * 100, 1) if question_type in ["all", "closed"] else 0.0
+    bleu = round(o_scores.get('BLEU', 0) * 100, 1) if question_type in ["all", "open"] else 0.0
+    rouge = round(o_scores.get('ROUGE-L', 0) * 100, 1) if question_type in ["all", "open"] else 0.0
     return {
         "Accuracy": accuracy,
         "F1-Score": f1,
@@ -642,6 +650,10 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
                 
             client_sizes = [len(c.local_dataset) for c in clients]
             global_weights = server.aggregate_weights(client_weights_list, client_sizes=client_sizes)
+            
+            # Save individual client weights before overwriting them
+            final_local_weights = [{k: v.clone() for k, v in w.items()} for w in client_weights_list]
+            
             for client in clients:
                 client.lora_weights = {k: v.clone() for k, v in global_weights.items()}
                 
@@ -683,6 +695,33 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     
     results_dict["Results"]["Proposed (Fed+RAG)"]["PathVQA"] = format_scores_for_json(pv_c, pv_o, question_type=question_type)
     results_dict["Results"]["Proposed (Fed+RAG)"]["Inference_Time_Seconds"] = round(pv_t, 2)
+
+    # Evaluate individual clients on path_vqa_eval (global test set)
+    if 'final_local_weights' in locals() and final_local_weights:
+        print("\nEvaluating individual clients (local models before final aggregation) on PathVQA global evaluation set...")
+        results_dict["Results"]["Individual_Clients_Global_Test"] = {}
+        for idx, weights in enumerate(final_local_weights):
+            shared_slm.model.load_state_dict(weights, strict=False)
+            c_res, o_res, _ = evaluate_dataset(shared_slm, path_vqa_eval, eval_rag_contexts, evaluator, question_type=question_type)
+            client_scores = format_scores_for_json(c_res, o_res, question_type=question_type)
+            print(f"  Hospital_{idx+1} (Global Test Set) - Accuracy: {client_scores['Accuracy']}%, F1-Score: {client_scores['F1-Score']}%, BLEU: {client_scores['BLEU']}%, ROUGE-L: {client_scores['ROUGE-L']}%")
+            results_dict["Results"]["Individual_Clients_Global_Test"][f"Hospital_{idx+1}"] = client_scores
+
+        print("\nEvaluating individual clients on their own local dataset (subset of max 50 samples)...")
+        results_dict["Results"]["Individual_Clients_Local_Data"] = {}
+        for idx, client in enumerate(clients):
+            shared_slm.model.load_state_dict(final_local_weights[idx], strict=False)
+            local_ds = client.local_dataset
+            local_ctx = client.rag_contexts
+            eval_indices = list(range(min(50, len(local_ds))))
+            sub_ds = local_ds.select(eval_indices)
+            sub_ctx = [local_ctx[j] for j in eval_indices]
+            
+            c_res, o_res, _ = evaluate_dataset(shared_slm, sub_ds, sub_ctx, evaluator, question_type=question_type)
+            client_scores = format_scores_for_json(c_res, o_res, question_type=question_type)
+            print(f"  Hospital_{idx+1} (Local Dataset Subset) - Accuracy: {client_scores['Accuracy']}%, F1-Score: {client_scores['F1-Score']}%, BLEU: {client_scores['BLEU']}%, ROUGE-L: {client_scores['ROUGE-L']}%")
+            results_dict["Results"]["Individual_Clients_Local_Data"][f"Hospital_{idx+1}"] = client_scores
+
     save_current_progress("All Experiments Completed")
     print(f"\nCOMPLETED! Evaluation metrics saved to: {json_path}")
 
