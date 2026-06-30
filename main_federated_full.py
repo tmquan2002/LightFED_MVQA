@@ -441,16 +441,18 @@ def clear_memory():
         torch.cuda.empty_cache()
 
 def format_scores_for_json(c_scores, o_scores, question_type="all"):
-    accuracy = round(c_scores.get('Accuracy', 0) * 100, 1) if question_type in ["all", "closed"] else 0.0
-    f1 = round(c_scores.get('F1-Score', 0) * 100, 1) if question_type in ["all", "closed"] else 0.0
-    bleu = round(o_scores.get('BLEU', 0) * 100, 1) if question_type in ["all", "open"] else 0.0
-    rouge = round(o_scores.get('ROUGE-L', 0) * 100, 1) if question_type in ["all", "open"] else 0.0
-    return {
-        "Accuracy": accuracy,
-        "F1-Score": f1,
-        "BLEU": bleu,
-        "ROUGE-L": rouge
-    }
+    res = {}
+    if question_type in ["all", "closed"]:
+        res["Closed-Ended"] = {
+            "Accuracy": round(c_scores.get('Accuracy', 0) * 100, 1),
+            "F1-Score": round(c_scores.get('F1-Score', 0) * 100, 1)
+        }
+    if question_type in ["all", "open"]:
+        res["Open-Ended"] = {
+            "BLEU": round(o_scores.get('BLEU', 0) * 100, 1),
+            "ROUGE-L": round(o_scores.get('ROUGE-L', 0) * 100, 1)
+        }
+    return res
 
 def evaluate_dataset(shared_slm, dataset, rag_contexts, evaluator, question_type="all"):
     shared_slm.model.eval()
@@ -486,33 +488,38 @@ def evaluate_dataset(shared_slm, dataset, rag_contexts, evaluator, question_type
 def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha, question_type="all", max_samples=None):
     print(f"\nSTARTING DECOUPLED FL (TEXT-ONLY WITH RAG): {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'} | Question Type = {question_type.upper()} | Max Samples = {max_samples if max_samples is not None else 'ALL'}")
     
-    path_vqa = load_dataset("flaviagiammarino/path-vqa")
-    path_vqa_train = path_vqa["train"]
-    path_vqa_test = path_vqa["test"]
+    from datasets import concatenate_datasets
+    vqa_rad = load_dataset("flaviagiammarino/vqa-rad")
+    vqa_rad_full = concatenate_datasets([vqa_rad["train"], vqa_rad["test"]])
     
     random.seed(int(time.time()))
     eval_seed = random.randint(0, 1000000)
-    print(f"Using random evaluation seed: {eval_seed}")
+    print(f"Using random dataset split seed: {eval_seed}")
     
-    path_vqa_shuffled = path_vqa_test.shuffle(seed=eval_seed+1)
-    eval_size = 50
-    path_vqa_eval = path_vqa_shuffled.select(range(min(eval_size, len(path_vqa_test))))
+    vqa_rad_full_shuffled = vqa_rad_full.shuffle(seed=eval_seed)
+    eval_size = 451
+    vqa_rad_eval = vqa_rad_full_shuffled.select(range(eval_size))
+    vqa_rad_train_val = vqa_rad_full_shuffled.select(range(eval_size, len(vqa_rad_full_shuffled)))
     
-    print(f"Evaluating with {len(path_vqa_eval)} PathVQA images (from official TEST set)")
+    val_size = int(0.1 * len(vqa_rad_train_val))
+    vqa_rad_val = vqa_rad_train_val.select(range(val_size))
+    vqa_rad_train = vqa_rad_train_val.select(range(val_size, len(vqa_rad_train_val)))
+    
+    print(f"Dataset split: Train: {len(vqa_rad_train)}, Validation: {len(vqa_rad_val)}, Test: {len(vqa_rad_eval)}")
     
     evaluator = MedVQAEvaluator()
     server = FederatedServer()
 
     # Split Data
-    splitter_seed_pv = random.randint(0, 1000000)
-    splitter_pv = FederatedDataSplitter(path_vqa_train, num_clients=num_clients, seed=splitter_seed_pv, question_type=question_type, max_samples=max_samples)
+    splitter_seed_rad = random.randint(0, 1000000)
+    splitter_rad = FederatedDataSplitter(vqa_rad_train, num_clients=num_clients, seed=splitter_seed_rad, question_type=question_type, max_samples=max_samples)
     if split_type == 'iid':
-        client_datasets_pv = splitter_pv.split_iid()
+        client_datasets_rad = splitter_rad.split_iid()
     else:
-        client_datasets_pv = splitter_pv.split_non_iid(alpha=alpha)
+        client_datasets_rad = splitter_rad.split_non_iid(alpha=alpha)
         
-    total_samples_pv = sum(len(ds) for ds in client_datasets_pv)
-    contributions_pv = {f"Hospital_{i+1}": round((len(ds) / total_samples_pv) * 100, 2) for i, ds in enumerate(client_datasets_pv)}
+    total_samples_rad = sum(len(ds) for ds in client_datasets_rad)
+    contributions_rad = {f"Hospital_{i+1}": round((len(ds) / total_samples_rad) * 100, 2) for i, ds in enumerate(client_datasets_rad)}
     
     # Precompute RAG Contexts (BiomedCLIP)
     print("\n[RAG] Loading BiomedCLIP to precompute all FAISS indices and contexts...")
@@ -525,17 +532,25 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     # Global Eval RAG
     print("  Precomputing for Global Evaluation...")
     retriever_global = MedicalRetriever("global")
-    retriever_global.build_index(path_vqa_train, biomed_model, preprocess, biomed_tokenizer)
-    eval_queries = retriever_global.compute_queries(path_vqa_eval, biomed_model, preprocess, biomed_tokenizer)
+    retriever_global.build_index(vqa_rad_train, biomed_model, preprocess, biomed_tokenizer)
+    eval_queries = retriever_global.compute_queries(vqa_rad_eval, biomed_model, preprocess, biomed_tokenizer)
     eval_rag_contexts = []
-    for i in range(len(path_vqa_eval)):
+    for i in range(len(vqa_rad_eval)):
         cases = retriever_global.search_cases(eval_queries[i], c=3)
         ctx = "\n".join([f"- Question: {c['question']}\n  Answer: {c['answer']}" for c in cases])
         eval_rag_contexts.append(ctx)
 
+    print("  Precomputing for Validation...")
+    val_queries = retriever_global.compute_queries(vqa_rad_val, biomed_model, preprocess, biomed_tokenizer)
+    val_rag_contexts = []
+    for i in range(len(vqa_rad_val)):
+        cases = retriever_global.search_cases(val_queries[i], c=3)
+        ctx = "\n".join([f"- Question: {c['question']}\n  Answer: {c['answer']}" for c in cases])
+        val_rag_contexts.append(ctx)
+
     # Client Local RAG
     client_rag_contexts = []
-    for i, ds in enumerate(client_datasets_pv):
+    for i, ds in enumerate(client_datasets_rad):
         print(f"  Precomputing for Hospital {i+1}...")
         retriever_local = MedicalRetriever(f"client_{i}")
         local_embeds = retriever_local.build_index(ds, biomed_model, preprocess, biomed_tokenizer)
@@ -597,10 +612,10 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
         else:
             initial_lora_weights[k] = v.clone().cpu()
 
-    print(f"\n==================== EXPERIMENT: PathVQA ====================")
+    print(f"\n==================== EXPERIMENT: VQA-RAD ====================")
     shared_slm.model.load_state_dict(initial_lora_weights, strict=False)
     
-    checkpoint_pv = f"./model_checkpoints/lora_pv_{num_clients}clients_{num_rounds}rounds_{epochs}epochs_{split_type}_a{alpha_str}_textonly.pt"
+    checkpoint_rad = f"./model_checkpoints/lora_rad_{num_clients}clients_{num_rounds}rounds_{epochs}epochs_{split_type}_a{alpha_str}_textonly.pt"
     os.makedirs("./model_checkpoints", exist_ok=True)
 
     global_weights = None
@@ -610,12 +625,12 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     patience_counter = 0
     actual_rounds = 0
     final_loss = 0.0
-    total_train_time_pv = 0.0
+    total_train_time_rad = 0.0
     start_train_time = time.time()
 
-    if os.path.exists(checkpoint_pv):
-        print(f"\n[LOAD] Found existing trained weights checkpoint for PathVQA: {checkpoint_pv}")
-        checkpoint = torch.load(checkpoint_pv, map_location='cpu')
+    if os.path.exists(checkpoint_rad):
+        print(f"\n[LOAD] Found existing trained weights checkpoint for VQA-RAD: {checkpoint_rad}")
+        checkpoint = torch.load(checkpoint_rad, map_location='cpu')
         if isinstance(checkpoint, dict) and 'weights' in checkpoint:
             global_weights = checkpoint['weights']
             start_round = checkpoint.get('round', num_rounds) + 1
@@ -636,10 +651,10 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     if start_round <= num_rounds:
         for i in range(num_clients):
             initial_client_weights = global_weights if global_weights is not None else initial_lora_weights
-            clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_pv[i], client_rag_contexts[i], initial_client_weights))
+            clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_rad[i], client_rag_contexts[i], initial_client_weights))
             
         for round_num in range(start_round, num_rounds + 1):
-            print(f"  [PathVQA] Round {round_num}/{num_rounds}: Training...")
+            print(f"  [VQA-RAD] Round {round_num}/{num_rounds}: Training...")
             client_weights_list = []
             client_losses = []
             
@@ -660,7 +675,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
             avg_loss = sum(client_losses) / len(client_losses)
             final_loss = avg_loss
             actual_rounds = round_num
-            print(f"  [PathVQA] Round {round_num} Avg Loss: {avg_loss:.4f}")
+            print(f"  [VQA-RAD] Round {round_num} Avg Loss: {avg_loss:.4f}")
             
             if avg_loss < best_loss - 0.001:
                 best_loss = avg_loss
@@ -673,38 +688,42 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
                 'weights': global_weights,
                 'best_loss': best_loss,
                 'patience_counter': patience_counter
-            }, checkpoint_pv)
-            print(f"  [PathVQA] Auto-saved Round {round_num} checkpoint.")
+            }, checkpoint_rad)
+            print(f"  [VQA-RAD] Auto-saved Round {round_num} checkpoint.")
 
             if patience_counter >= patience:
-                print(f"  [PathVQA] Early stopping triggered.")
+                print(f"  [VQA-RAD] Early stopping triggered.")
                 break
                 
-        total_train_time_pv = round(time.time() - start_train_time, 2)
+        total_train_time_rad = round(time.time() - start_train_time, 2)
         
-    results_dict["Training_Stats"]["PathVQA"] = {
-        "Client_Data_Contributions_Percent": contributions_pv,
+    results_dict["Training_Stats"]["VQA-RAD"] = {
+        "Client_Data_Contributions_Percent": contributions_rad,
         "Actual_Rounds_Run": actual_rounds,
         "Final_Average_Loss": round(final_loss, 4) if isinstance(final_loss, (int, float)) else final_loss,
-        "Training_Time_Seconds": total_train_time_pv
+        "Training_Time_Seconds": total_train_time_rad
     }
     
     shared_slm.model.load_state_dict(global_weights, strict=False)
-    print("\nEvaluating PathVQA (Decoupled Fed+RAG)...")
-    pv_c, pv_o, pv_t = evaluate_dataset(shared_slm, path_vqa_eval, eval_rag_contexts, evaluator, question_type=question_type)
+    print("\nEvaluating VQA-RAD Validation Set...")
+    val_c, val_o, val_t = evaluate_dataset(shared_slm, vqa_rad_val, val_rag_contexts, evaluator, question_type=question_type)
+    results_dict["Results"]["Proposed (Fed+RAG)"]["VQA-RAD_Validation"] = format_scores_for_json(val_c, val_o, question_type=question_type)
+
+    print("\nEvaluating VQA-RAD Test Set (Decoupled Fed+RAG)...")
+    pv_c, pv_o, pv_t = evaluate_dataset(shared_slm, vqa_rad_eval, eval_rag_contexts, evaluator, question_type=question_type)
     
-    results_dict["Results"]["Proposed (Fed+RAG)"]["PathVQA"] = format_scores_for_json(pv_c, pv_o, question_type=question_type)
+    results_dict["Results"]["Proposed (Fed+RAG)"]["VQA-RAD_Test"] = format_scores_for_json(pv_c, pv_o, question_type=question_type)
     results_dict["Results"]["Proposed (Fed+RAG)"]["Inference_Time_Seconds"] = round(pv_t, 2)
 
-    # Evaluate individual clients on path_vqa_eval (global test set)
+    # Evaluate individual clients on vqa_rad_eval (global test set)
     if 'final_local_weights' in locals() and final_local_weights:
-        print("\nEvaluating individual clients (local models before final aggregation) on PathVQA global evaluation set...")
+        print("\nEvaluating individual clients (local models before final aggregation) on VQA-RAD global evaluation set...")
         results_dict["Results"]["Individual_Clients_Global_Test"] = {}
         for idx, weights in enumerate(final_local_weights):
             shared_slm.model.load_state_dict(weights, strict=False)
-            c_res, o_res, _ = evaluate_dataset(shared_slm, path_vqa_eval, eval_rag_contexts, evaluator, question_type=question_type)
+            c_res, o_res, _ = evaluate_dataset(shared_slm, vqa_rad_eval, eval_rag_contexts, evaluator, question_type=question_type)
             client_scores = format_scores_for_json(c_res, o_res, question_type=question_type)
-            print(f"  Hospital_{idx+1} (Global Test Set) - Accuracy: {client_scores['Accuracy']}%, F1-Score: {client_scores['F1-Score']}%, BLEU: {client_scores['BLEU']}%, ROUGE-L: {client_scores['ROUGE-L']}%")
+            print(f"  Hospital_{idx+1} (Global Test Set) - {client_scores}")
             results_dict["Results"]["Individual_Clients_Global_Test"][f"Hospital_{idx+1}"] = client_scores
 
         print("\nEvaluating individual clients on their own local dataset (subset of max 50 samples)...")
@@ -719,7 +738,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
             
             c_res, o_res, _ = evaluate_dataset(shared_slm, sub_ds, sub_ctx, evaluator, question_type=question_type)
             client_scores = format_scores_for_json(c_res, o_res, question_type=question_type)
-            print(f"  Hospital_{idx+1} (Local Dataset Subset) - Accuracy: {client_scores['Accuracy']}%, F1-Score: {client_scores['F1-Score']}%, BLEU: {client_scores['BLEU']}%, ROUGE-L: {client_scores['ROUGE-L']}%")
+            print(f"  Hospital_{idx+1} (Local Dataset Subset) - {client_scores}")
             results_dict["Results"]["Individual_Clients_Local_Data"][f"Hospital_{idx+1}"] = client_scores
 
     save_current_progress("All Experiments Completed")
@@ -727,7 +746,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
 
     if 'clients' in locals():
         del clients
-    del client_datasets_pv
+    del client_datasets_rad
     clear_memory()
 
 def get_user_setup():
