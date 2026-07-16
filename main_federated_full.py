@@ -26,6 +26,7 @@ class FederatedDataSplitter:
     def __init__(self, dataset: Dataset, num_clients: int = 2, seed: int = None, question_type: str = "all", max_samples: int = None):
         self.num_clients = num_clients
         self.seed = seed
+        self.max_samples = max_samples
         
         filtered_dataset = dataset
         if question_type in ["closed", "open"]:
@@ -38,17 +39,6 @@ class FederatedDataSplitter:
                     indices.append(idx)
             filtered_dataset = dataset.select(indices)
             print(f"[DataSplitter] Filtered dataset to {question_type} questions: {len(dataset)} -> {len(filtered_dataset)} samples.")
-            
-        if max_samples is not None and len(filtered_dataset) > max_samples:
-            import random
-            if seed is not None:
-                random.seed(seed)
-            else:
-                random.seed(42)
-            indices = random.sample(range(len(filtered_dataset)), max_samples)
-            indices.sort()
-            filtered_dataset = filtered_dataset.select(indices)
-            print(f"[DataSplitter] Limited dataset to {max_samples} samples.")
             
         self.dataset = filtered_dataset
         
@@ -63,7 +53,13 @@ class FederatedDataSplitter:
         for i in range(self.num_clients):
             start_idx = i * split_size
             end_idx = len(shuffled_dataset) if i == self.num_clients - 1 else (i + 1) * split_size
-            client_datasets.append(shuffled_dataset.select(range(start_idx, end_idx)))
+            client_ds = shuffled_dataset.select(range(start_idx, end_idx))
+            
+            if self.max_samples is not None:
+                client_ds = client_ds.select(range(min(self.max_samples, len(client_ds))))
+                print(f"[DataSplitter] Limited Hospital {i+1} dataset to {len(client_ds)} samples (max_samples={self.max_samples}).")
+                
+            client_datasets.append(client_ds)
         return client_datasets
 
     def split_non_iid(self, alpha: float = 0.5):
@@ -91,15 +87,20 @@ class FederatedDataSplitter:
                 client_indices[i].extend(idx_splits[i].tolist())
                 
         client_datasets = []
-        for indices in client_indices:
+        for i, indices in enumerate(client_indices):
             np.random.shuffle(indices)
             if len(indices) == 0:
                 indices = [np.random.randint(0, len(self.dataset))]
-            client_datasets.append(self.dataset.select(indices))
+            client_ds = self.dataset.select(indices)
+            
+            if self.max_samples is not None:
+                client_ds = client_ds.select(range(min(self.max_samples, len(client_ds))))
+                
+            client_datasets.append(client_ds)
             
         print(f"[DataSplitter] Non-IID splitted (alpha={alpha}).")
         for i, ds in enumerate(client_datasets):
-            print(f"Hospital {i+1} receives: {len(ds)} photos.")
+            print(f"Hospital {i+1} receives: {len(ds)} photos (max_samples={self.max_samples}).")
         return client_datasets
     def build_prompt(question, retrieved_cases):
         # 1. Format the retrieved knowledge
@@ -292,49 +293,8 @@ class MedicalRetriever:
                 break
         return results
 
-# --- src/models/qwen_slm.py ---
-class QwenMedVQA:
-    def __init__(self, model_id="Qwen/Qwen2.5-0.5B-Instruct", use_4bit=True):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        quantization_config = None
-        if use_4bit and self.device == "cuda":
-            from transformers import BitsAndBytesConfig
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            )
-            
-        torch_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-        
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            quantization_config=quantization_config,
-            device_map="auto" if use_4bit else self.device,
-            torch_dtype=torch_dtype
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-    def predict(self, question, context=""):
-        prompt = f"Question:\n{question}\n\nRetrieved Knowledge:\n{context}\n\nAnswer:\n"
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        
-        with torch.no_grad():
-            output_ids = self.model.generate(
-                **inputs, 
-                max_new_tokens=50,
-                do_sample=False,        
-                num_beams=1,            
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
-            )
-            
-        prompt_len = inputs['input_ids'].shape[1]
-        raw_ans = self.tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=True).strip()
-        return raw_ans
+from src.models.qwen_slm import QwenMedVQA
+from qwen_vl_utils import process_vision_info
 
 # --- main_federated.py ---
 class VirtualClient:
@@ -346,16 +306,18 @@ class VirtualClient:
 
     def train_local(self, shared_slm, epochs=1):
         import torch.optim as optim
+        from PIL import Image
+        import io
         
         print(f"  [{self.client_id}] Training locally for {epochs} epoch(s)...")
         model = shared_slm.model
-        tokenizer = shared_slm.tokenizer
+        processor = shared_slm.processor
         device = shared_slm.device
         
         model.load_state_dict(self.lora_weights, strict=False)
         model.train()
         
-        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-5)
+        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
         scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
         
         total_loss = 0.0
@@ -364,6 +326,19 @@ class VirtualClient:
         
         indices = list(range(len(self.local_dataset)))
         
+        def optimize_img(pil_img, max_res=336):
+            if pil_img.mode != "RGB":
+                pil_img = pil_img.convert("RGB")
+            pil_img.thumbnail((max_res, max_res), Image.Resampling.LANCZOS)
+            return pil_img
+
+        def preprocess_image(image):
+            if isinstance(image, dict) and 'bytes' in image:
+                return Image.open(io.BytesIO(image['bytes'])).convert("RGB")
+            elif isinstance(image, str):
+                return Image.open(image).convert("RGB")
+            return image
+            
         for epoch in range(epochs):
             random.shuffle(indices)
             epoch_indices = indices
@@ -372,27 +347,75 @@ class VirtualClient:
             for i, idx in enumerate(epoch_indices):
                 sample = self.local_dataset[idx]
                 question = sample['question']
-                answer = str(sample['answer'])
-                context = self.rag_contexts[idx]
+                answer = str(sample['answer']).lower()
+                retrieved_cases = self.rag_contexts[idx]
                 
-                prompt = f"Question:\n{question}\n\nRetrieved Knowledge:\n{context}\n\nAnswer:\n"
+                messages = []
+                for j, case in enumerate(retrieved_cases):
+                    try:
+                        ref_img = preprocess_image(case['image'])
+                        ref_img = optimize_img(ref_img)
+                        messages.append({
+                            "role": "user",
+                            "content": [
+                                {"type": "image", "image": ref_img},
+                                {"type": "text", "text": f"Reference Case {j+1}:\nQuestion: {case['question']}"}
+                            ]
+                        })
+                        messages.append({
+                            "role": "assistant",
+                            "content": [
+                                {"type": "text", "text": f"Answer: {case['answer']}"}
+                            ]
+                        })
+                    except Exception:
+                        continue
                 
-                prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
-                answer_ids = tokenizer.encode(answer, add_special_tokens=False) + [tokenizer.eos_token_id]
-                
-                input_ids = prompt_ids + answer_ids
-                labels = [-100] * len(prompt_ids) + answer_ids
-                
-                max_length = 512
-                if len(input_ids) > max_length:
-                    input_ids = input_ids[:max_length]
-                    labels = labels[:max_length]
-                
-                inputs = {
-                    "input_ids": torch.tensor([input_ids]).to(device),
-                    "attention_mask": torch.tensor([[1]*len(input_ids)]).to(device),
-                    "labels": torch.tensor([labels]).to(device)
-                }
+                try:
+                    target_img = preprocess_image(sample['image'])
+                    target_img = optimize_img(target_img)
+                    messages.append({
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": target_img},
+                            {"type": "text", "text": f"Current Question: {question}\nBased on the reference cases above, what is the correct answer for the current case? Answer concisely."}
+                        ]
+                    })
+                    messages.append({
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": answer}
+                        ]
+                    })
+                    
+                    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+                    image_inputs, video_inputs = process_vision_info(messages)
+                    
+                    inputs = processor(
+                        text=[text],
+                        images=image_inputs,
+                        videos=video_inputs,
+                        padding=True,
+                        return_tensors="pt",
+                    ).to(device)
+                    
+                    prompt_text = processor.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True)
+                    prompt_inputs = processor(
+                        text=[prompt_text],
+                        images=image_inputs,
+                        videos=video_inputs,
+                        padding=True,
+                        return_tensors="pt",
+                    )
+                    prompt_len = prompt_inputs['input_ids'].shape[1]
+                    
+                    labels = inputs['input_ids'].clone()
+                    labels[:, :min(prompt_len, labels.shape[1])] = -100
+                    inputs['labels'] = labels
+                    
+                except Exception as e:
+                    print(f"Error preparing multimodal inputs: {e}")
+                    continue
                 
                 if scaler is not None:
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
@@ -473,7 +496,7 @@ def evaluate_dataset(shared_slm, dataset, rag_contexts, evaluator, question_type
         elif question_type == "closed" and not is_closed:
             continue
             
-        pred = shared_slm.predict(question, context=context)
+        pred = shared_slm.predict(sample['image'], question, retrieved_cases=context)
         
         if is_closed:
             closed_preds.append(pred); closed_refs.append(ground_truth)
@@ -486,15 +509,15 @@ def evaluate_dataset(shared_slm, dataset, rag_contexts, evaluator, question_type
     return evaluator.evaluate_closed_ended(closed_preds, closed_refs), evaluator.evaluate_open_ended(open_preds, open_refs), infer_time
 
 def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha, question_type="all", max_samples=None):
-    print(f"\nSTARTING DECOUPLED FL (TEXT-ONLY WITH RAG): {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'} | Question Type = {question_type.upper()} | Max Samples = {max_samples if max_samples is not None else 'ALL'}")
+    print(f"\nSTARTING DECOUPLED FL (MULTIMODAL QWEN2-VL WITH RAG): {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'} | Question Type = {question_type.upper()} | Max Samples = {max_samples if max_samples is not None else 'ALL'}")
     
     from datasets import concatenate_datasets
     vqa_rad = load_dataset("flaviagiammarino/vqa-rad")
     vqa_rad_full = concatenate_datasets([vqa_rad["train"], vqa_rad["test"]])
     
-    random.seed(int(time.time()))
-    eval_seed = random.randint(0, 1000000)
-    print(f"Using random dataset split seed: {eval_seed}")
+    eval_seed = 42
+    random.seed(eval_seed)
+    print(f"Using fixed dataset split seed: {eval_seed}")
     
     vqa_rad_full_shuffled = vqa_rad_full.shuffle(seed=eval_seed)
     eval_size = 451
@@ -511,7 +534,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     server = FederatedServer()
 
     # Split Data
-    splitter_seed_rad = random.randint(0, 1000000)
+    splitter_seed_rad = 42
     splitter_rad = FederatedDataSplitter(vqa_rad_train, num_clients=num_clients, seed=splitter_seed_rad, question_type=question_type, max_samples=max_samples)
     if split_type == 'iid':
         client_datasets_rad = splitter_rad.split_iid()
@@ -537,16 +560,14 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     eval_rag_contexts = []
     for i in range(len(vqa_rad_eval)):
         cases = retriever_global.search_cases(eval_queries[i], c=3)
-        ctx = "\n".join([f"- Question: {c['question']}\n  Answer: {c['answer']}" for c in cases])
-        eval_rag_contexts.append(ctx)
+        eval_rag_contexts.append(cases)
 
     print("  Precomputing for Validation...")
     val_queries = retriever_global.compute_queries(vqa_rad_val, biomed_model, preprocess, biomed_tokenizer)
     val_rag_contexts = []
     for i in range(len(vqa_rad_val)):
         cases = retriever_global.search_cases(val_queries[i], c=3)
-        ctx = "\n".join([f"- Question: {c['question']}\n  Answer: {c['answer']}" for c in cases])
-        val_rag_contexts.append(ctx)
+        val_rag_contexts.append(cases)
 
     # Client Local RAG
     client_rag_contexts = []
@@ -557,8 +578,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
         rag_ctx = []
         for j in range(len(ds)):
             cases = retriever_local.search_cases(local_embeds[j], c=3, avoid_self_idx=j)
-            ctx = "\n".join([f"- Question: {c['question']}\n  Answer: {c['answer']}" for c in cases])
-            rag_ctx.append(ctx)
+            rag_ctx.append(cases)
         client_rag_contexts.append(rag_ctx)
 
     # Free BiomedCLIP completely
@@ -569,7 +589,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
 
     os.makedirs("./data", exist_ok=True)
     alpha_str = str(alpha) if split_type == 'non-iid' else "NA"
-    file_name = f"eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}_textonly.json"
+    file_name = f"eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}_multimodal.json"
     json_path = os.path.join("./data", file_name)
     
     results_dict = {
@@ -579,7 +599,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
             "Local_Epochs": epochs,
             "Split_Type": split_type.upper(),
             "Alpha": alpha if split_type == 'non-iid' else "NA",
-            "Model_Type": "Decoupled FL (Text-only Qwen) with RAG"
+            "Model_Type": "Decoupled FL (Multimodal Qwen2-VL) with RAG"
         },
         "Training_Stats": {},
         "Results": {
@@ -596,8 +616,8 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     shared_slm = QwenMedVQA(use_4bit=True)
     shared_slm.model = prepare_model_for_kbit_training(shared_slm.model)
     lora_config = LoraConfig(
-        r=8, 
-        lora_alpha=16, 
+        r=16, 
+        lora_alpha=32, 
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"], 
         lora_dropout=0.05, 
         bias="none", 
@@ -714,32 +734,6 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     
     results_dict["Results"]["Proposed (Fed+RAG)"]["VQA-RAD_Test"] = format_scores_for_json(pv_c, pv_o, question_type=question_type)
     results_dict["Results"]["Proposed (Fed+RAG)"]["Inference_Time_Seconds"] = round(pv_t, 2)
-
-    # Evaluate individual clients on vqa_rad_eval (global test set)
-    if 'final_local_weights' in locals() and final_local_weights:
-        print("\nEvaluating individual clients (local models before final aggregation) on VQA-RAD global evaluation set...")
-        results_dict["Results"]["Individual_Clients_Global_Test"] = {}
-        for idx, weights in enumerate(final_local_weights):
-            shared_slm.model.load_state_dict(weights, strict=False)
-            c_res, o_res, _ = evaluate_dataset(shared_slm, vqa_rad_eval, eval_rag_contexts, evaluator, question_type=question_type)
-            client_scores = format_scores_for_json(c_res, o_res, question_type=question_type)
-            print(f"  Hospital_{idx+1} (Global Test Set) - {client_scores}")
-            results_dict["Results"]["Individual_Clients_Global_Test"][f"Hospital_{idx+1}"] = client_scores
-
-        print("\nEvaluating individual clients on their own local dataset (subset of max 50 samples)...")
-        results_dict["Results"]["Individual_Clients_Local_Data"] = {}
-        for idx, client in enumerate(clients):
-            shared_slm.model.load_state_dict(final_local_weights[idx], strict=False)
-            local_ds = client.local_dataset
-            local_ctx = client.rag_contexts
-            eval_indices = list(range(min(50, len(local_ds))))
-            sub_ds = local_ds.select(eval_indices)
-            sub_ctx = [local_ctx[j] for j in eval_indices]
-            
-            c_res, o_res, _ = evaluate_dataset(shared_slm, sub_ds, sub_ctx, evaluator, question_type=question_type)
-            client_scores = format_scores_for_json(c_res, o_res, question_type=question_type)
-            print(f"  Hospital_{idx+1} (Local Dataset Subset) - {client_scores}")
-            results_dict["Results"]["Individual_Clients_Local_Data"][f"Hospital_{idx+1}"] = client_scores
 
     save_current_progress("All Experiments Completed")
     print(f"\nCOMPLETED! Evaluation metrics saved to: {json_path}")
