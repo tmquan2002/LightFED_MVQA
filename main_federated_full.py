@@ -1,3 +1,4 @@
+from datetime import datetime
 import json
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -293,8 +294,59 @@ class MedicalRetriever:
                 break
         return results
 
-from src.models.qwen_slm import QwenMedVQA
-from qwen_vl_utils import process_vision_info
+# --- src/models/qwen_slm.py (text-only variant) ---
+class QwenMedVQA:
+    def __init__(self, model_id="Qwen/Qwen2.5-0.5B-Instruct", use_4bit=True):
+        # Larger model options (comment out above and uncomment one below to upgrade):
+        # model_id = "Qwen/Qwen2.5-1.5B-Instruct"   # ~3x capacity, still fits in 4-bit
+        # model_id = "Qwen/Qwen2.5-3B-Instruct"      # stronger medical reasoning
+        # model_id = "Qwen/Qwen2.5-7B-Instruct"      # best quality, needs more VRAM
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        quantization_config = None
+        if use_4bit and self.device == "cuda":
+            from transformers import BitsAndBytesConfig
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            )
+
+        torch_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            quantization_config=quantization_config,
+            device_map="auto" if use_4bit else self.device,
+            torch_dtype=torch_dtype
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    def predict(self, question, context=""):
+        # Same system prompt used during training so inference matches the fine-tuned behaviour
+        messages = [
+            {"role": "system", "content": "You are a precise medical AI assistant. Answer the question as briefly and accurately as possible based on the provided retrieved knowledge. For yes/no questions, output only 'yes' or 'no'. For open-ended questions, output only the direct answer word or phrase without extra explanations."},
+            {"role": "user", "content": f"Retrieved Knowledge:\n{context}\n\nQuestion: {question}"}
+        ]
+        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=50,
+                do_sample=False,
+                num_beams=1,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+
+        prompt_len = inputs['input_ids'].shape[1]
+        raw_ans = self.tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=True).strip()
+        return raw_ans
+
 
 # --- main_federated.py ---
 class VirtualClient:
@@ -306,12 +358,10 @@ class VirtualClient:
 
     def train_local(self, shared_slm, epochs=1):
         import torch.optim as optim
-        from PIL import Image
-        import io
         
         print(f"  [{self.client_id}] Training locally for {epochs} epoch(s)...")
         model = shared_slm.model
-        processor = shared_slm.processor
+        tokenizer = shared_slm.tokenizer
         device = shared_slm.device
         
         model.load_state_dict(self.lora_weights, strict=False)
@@ -326,19 +376,6 @@ class VirtualClient:
         
         indices = list(range(len(self.local_dataset)))
         
-        def optimize_img(pil_img, max_res=336):
-            if pil_img.mode != "RGB":
-                pil_img = pil_img.convert("RGB")
-            pil_img.thumbnail((max_res, max_res), Image.Resampling.LANCZOS)
-            return pil_img
-
-        def preprocess_image(image):
-            if isinstance(image, dict) and 'bytes' in image:
-                return Image.open(io.BytesIO(image['bytes'])).convert("RGB")
-            elif isinstance(image, str):
-                return Image.open(image).convert("RGB")
-            return image
-            
         for epoch in range(epochs):
             random.shuffle(indices)
             epoch_indices = indices
@@ -347,75 +384,31 @@ class VirtualClient:
             for i, idx in enumerate(epoch_indices):
                 sample = self.local_dataset[idx]
                 question = sample['question']
-                answer = str(sample['answer']).lower()
-                retrieved_cases = self.rag_contexts[idx]
+                answer = str(sample['answer'])
+                context = self.rag_contexts[idx]
                 
-                messages = []
-                for j, case in enumerate(retrieved_cases):
-                    try:
-                        ref_img = preprocess_image(case['image'])
-                        ref_img = optimize_img(ref_img)
-                        messages.append({
-                            "role": "user",
-                            "content": [
-                                {"type": "image", "image": ref_img},
-                                {"type": "text", "text": f"Reference Case {j+1}:\nQuestion: {case['question']}"}
-                            ]
-                        })
-                        messages.append({
-                            "role": "assistant",
-                            "content": [
-                                {"type": "text", "text": f"Answer: {case['answer']}"}
-                            ]
-                        })
-                    except Exception:
-                        continue
+                messages = [
+                    {"role": "system", "content": "You are a precise medical AI assistant. Answer the question as briefly and accurately as possible based on the provided retrieved knowledge. For yes/no questions, output only 'yes' or 'no'. For open-ended questions, output only the direct answer word or phrase without extra explanations."},
+                    {"role": "user", "content": f"Retrieved Knowledge:\n{context}\n\nQuestion: {question}"}
+                ]
+                prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                 
-                try:
-                    target_img = preprocess_image(sample['image'])
-                    target_img = optimize_img(target_img)
-                    messages.append({
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": target_img},
-                            {"type": "text", "text": f"Current Question: {question}\nBased on the reference cases above, what is the correct answer for the current case? Answer concisely."}
-                        ]
-                    })
-                    messages.append({
-                        "role": "assistant",
-                        "content": [
-                            {"type": "text", "text": answer}
-                        ]
-                    })
-                    
-                    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-                    image_inputs, video_inputs = process_vision_info(messages)
-                    
-                    inputs = processor(
-                        text=[text],
-                        images=image_inputs,
-                        videos=video_inputs,
-                        padding=True,
-                        return_tensors="pt",
-                    ).to(device)
-                    
-                    prompt_text = processor.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True)
-                    prompt_inputs = processor(
-                        text=[prompt_text],
-                        images=image_inputs,
-                        videos=video_inputs,
-                        padding=True,
-                        return_tensors="pt",
-                    )
-                    prompt_len = prompt_inputs['input_ids'].shape[1]
-                    
-                    labels = inputs['input_ids'].clone()
-                    labels[:, :min(prompt_len, labels.shape[1])] = -100
-                    inputs['labels'] = labels
-                    
-                except Exception as e:
-                    print(f"Error preparing multimodal inputs: {e}")
-                    continue
+                prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+                answer_ids = tokenizer.encode(answer, add_special_tokens=False) + [tokenizer.eos_token_id]
+                
+                input_ids = prompt_ids + answer_ids
+                labels = [-100] * len(prompt_ids) + answer_ids
+                
+                max_length = 512
+                if len(input_ids) > max_length:
+                    input_ids = input_ids[:max_length]
+                    labels = labels[:max_length]
+                
+                inputs = {
+                    "input_ids": torch.tensor([input_ids]).to(device),
+                    "attention_mask": torch.tensor([[1]*len(input_ids)]).to(device),
+                    "labels": torch.tensor([labels]).to(device)
+                }
                 
                 if scaler is not None:
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
@@ -496,12 +489,23 @@ def evaluate_dataset(shared_slm, dataset, rag_contexts, evaluator, question_type
         elif question_type == "closed" and not is_closed:
             continue
             
-        pred = shared_slm.predict(sample['image'], question, retrieved_cases=context)
+        pred = shared_slm.predict(question, context=context)
+        pred_normalized = pred.strip().lower()
+        
+        # Normalize closed-ended predictions to exactly 'yes' or 'no'
+        if is_closed:
+            first_word = pred_normalized.split()[0].strip('.,!?;:') if pred_normalized.split() else pred_normalized
+            if first_word in ('yes', 'no'):
+                pred_normalized = first_word
+            elif 'yes' in pred_normalized:
+                pred_normalized = 'yes'
+            elif 'no' in pred_normalized:
+                pred_normalized = 'no'
         
         if is_closed:
-            closed_preds.append(pred); closed_refs.append(ground_truth)
+            closed_preds.append(pred_normalized); closed_refs.append(ground_truth)
         else:
-            open_preds.append(pred); open_refs.append(ground_truth)
+            open_preds.append(pred_normalized); open_refs.append(ground_truth)
             
     infer_time = round(time.time() - start_infer_time, 2)
     print(f"\nInference Time: {infer_time} seconds")
@@ -509,7 +513,7 @@ def evaluate_dataset(shared_slm, dataset, rag_contexts, evaluator, question_type
     return evaluator.evaluate_closed_ended(closed_preds, closed_refs), evaluator.evaluate_open_ended(open_preds, open_refs), infer_time
 
 def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha, question_type="all", max_samples=None):
-    print(f"\nSTARTING DECOUPLED FL (MULTIMODAL QWEN2-VL WITH RAG): {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'} | Question Type = {question_type.upper()} | Max Samples = {max_samples if max_samples is not None else 'ALL'}")
+    print(f"\nSTARTING DECOUPLED FL (TEXT-ONLY WITH RAG): {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'} | Question Type = {question_type.upper()} | Max Samples = {max_samples if max_samples is not None else 'ALL'}")
     
     from datasets import concatenate_datasets
     vqa_rad = load_dataset("flaviagiammarino/vqa-rad")
@@ -560,14 +564,16 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     eval_rag_contexts = []
     for i in range(len(vqa_rad_eval)):
         cases = retriever_global.search_cases(eval_queries[i], c=3)
-        eval_rag_contexts.append(cases)
+        ctx = "\n".join([f"- Question: {c['question']}\n  Answer: {c['answer']}" for c in cases])
+        eval_rag_contexts.append(ctx)
 
     print("  Precomputing for Validation...")
     val_queries = retriever_global.compute_queries(vqa_rad_val, biomed_model, preprocess, biomed_tokenizer)
     val_rag_contexts = []
     for i in range(len(vqa_rad_val)):
         cases = retriever_global.search_cases(val_queries[i], c=3)
-        val_rag_contexts.append(cases)
+        ctx = "\n".join([f"- Question: {c['question']}\n  Answer: {c['answer']}" for c in cases])
+        val_rag_contexts.append(ctx)
 
     # Client Local RAG
     client_rag_contexts = []
@@ -578,7 +584,8 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
         rag_ctx = []
         for j in range(len(ds)):
             cases = retriever_local.search_cases(local_embeds[j], c=3, avoid_self_idx=j)
-            rag_ctx.append(cases)
+            ctx = "\n".join([f"- Question: {c['question']}\n  Answer: {c['answer']}" for c in cases])
+            rag_ctx.append(ctx)
         client_rag_contexts.append(rag_ctx)
 
     # Free BiomedCLIP completely
@@ -589,7 +596,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
 
     os.makedirs("./data", exist_ok=True)
     alpha_str = str(alpha) if split_type == 'non-iid' else "NA"
-    file_name = f"eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}_multimodal.json"
+    file_name = f"eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}_textonly_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     json_path = os.path.join("./data", file_name)
     
     results_dict = {
@@ -599,7 +606,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
             "Local_Epochs": epochs,
             "Split_Type": split_type.upper(),
             "Alpha": alpha if split_type == 'non-iid' else "NA",
-            "Model_Type": "Decoupled FL (Multimodal Qwen2-VL) with RAG"
+            "Model_Type": "Decoupled FL (Text-only Qwen) with RAG"
         },
         "Training_Stats": {},
         "Results": {
