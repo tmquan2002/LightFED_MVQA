@@ -8,3 +8,4 @@ data/
 # Ignore personal keys
 .env
 .ipynb_checkpoints/
+.venv/
