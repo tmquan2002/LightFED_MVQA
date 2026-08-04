@@ -1,4 +1,3 @@
-from datetime import datetime
 import json
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -18,20 +17,13 @@ from PIL import Image
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import open_clip
 
-# --- SYSTEM PROMPT CHUẨN HÓA CẢI TIẾN (ĐÃ BỔ SUNG LỌC NHIỄU RAG) ---
-SYSTEM_PROMPT = (
-    "You are a precise medical AI assistant. Your task is to extract the exact answer based on the retrieved knowledge and visual evidence.\n"
-    "Rules:\n"
-    "- Pay attention to the similarity scores of retrieved cases. STRICTLY IGNORE or DISCARD any retrieved cases with low similarity or conflicting facts.\n"
-    "- For CLOSED-ENDED (Yes/No) questions: Output MUST be strictly 'yes' or 'no'. Focus on visual evidence and rely ONLY on highly relevant cases.\n"
-    "- For OPEN-ENDED questions: Synthesize ONLY from highly confident/relevant retrieved cases to provide the direct answer word or phrase without extra explanations."
-)
-
 # --- src/data_processing/data_splitter.py ---
 class FederatedDataSplitter:
     @staticmethod
-    def is_closed_ended(answer) -> bool:
-        ans = str(answer).lower().strip()
+    def is_closed_ended(item) -> bool:
+        if 'answer_type' in item and item['answer_type'] is not None:
+            return str(item['answer_type']).upper().strip() == 'CLOSED'
+        ans = str(item.get('answer', '')).lower().strip()
         return ans in ['yes', 'no'] or len(ans.split()) <= 2
 
     def __init__(self, dataset: Dataset, num_clients: int = 2, seed: int = None, question_type: str = "all", max_samples: int = None):
@@ -43,7 +35,7 @@ class FederatedDataSplitter:
         if question_type in ["closed", "open"]:
             indices = []
             for idx, item in enumerate(dataset):
-                is_closed = self.is_closed_ended(item['answer'])
+                is_closed = self.is_closed_ended(item)
                 if question_type == "closed" and is_closed:
                     indices.append(idx)
                 elif question_type == "open" and not is_closed:
@@ -142,6 +134,9 @@ class FederatedServer:
 
 # --- src/evaluation/metrics.py ---
 class MedVQAEvaluator:
+    def __init__(self):
+        pass
+
     def evaluate_closed_ended(self, preds, refs):
         cleaned_preds = [str(p).lower().strip() for p in preds]
         cleaned_refs = [str(r).lower().strip() for r in refs]
@@ -149,9 +144,11 @@ class MedVQAEvaluator:
         correct = 0
         mapped_preds = []
         for p, r in zip(cleaned_preds, cleaned_refs):
-            if p == r:
+            if r in p or p in r:
                 correct += 1
-            mapped_preds.append(p)
+                mapped_preds.append(r)
+            else:
+                mapped_preds.append(p)
 
         accuracy = correct / len(refs) if refs else 0.0
 
@@ -245,7 +242,7 @@ class MedicalRetriever:
                 embeds.append(comb.cpu().numpy()[0])
         return np.array(embeds, dtype=np.float32)
 
-    def search_cases(self, query_embed, c=3, avoid_self_idx=None, score_threshold=0.65):
+    def search_cases(self, query_embed, c=3, avoid_self_idx=None):
         search_k = c + (1 if avoid_self_idx is not None else 0)
         if search_k > self.index.ntotal:
             search_k = self.index.ntotal
@@ -254,20 +251,17 @@ class MedicalRetriever:
             
         D, I = self.index.search(query_embed.reshape(1, -1), search_k)
         results = []
-        for score, idx in zip(D[0], I[0]):
+        for idx in I[0]:
             if idx == avoid_self_idx:
                 continue
-            if score >= score_threshold:
-                case_info = self.metadata[idx].copy()
-                case_info['score'] = float(score)
-                results.append(case_info)
+            results.append(self.metadata[idx])
             if len(results) == c:
                 break
         return results
 
 # --- src/models/qwen_slm.py ---
 class QwenMedVQA:
-    def __init__(self, model_id="Qwen/Qwen2.5-1.5B-Instruct", use_4bit=True):
+    def __init__(self, model_id="Qwen/Qwen2.5-0.5B-Instruct", use_4bit=True):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         quantization_config = None
@@ -293,7 +287,7 @@ class QwenMedVQA:
 
     def predict(self, question, context=""):
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": "You are a precise medical AI assistant. Answer the question as briefly and accurately as possible based on the provided retrieved knowledge. For yes/no questions, output only 'yes' or 'no'. For open-ended questions, output only the direct answer word or phrase without extra explanations."},
             {"role": "user", "content": f"Retrieved Knowledge:\n{context}\n\nQuestion: {question}"}
         ]
         prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -313,7 +307,7 @@ class QwenMedVQA:
         raw_ans = self.tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=True).strip()
         return raw_ans
 
-# --- Virtual Client ---
+# --- VirtualClient ---
 class VirtualClient:
     def __init__(self, client_id, local_dataset, rag_contexts, initial_weights):
         self.client_id = client_id
@@ -338,6 +332,7 @@ class VirtualClient:
         total_loss = 0.0
         steps = 0
         accumulation_steps = 4
+        
         indices = list(range(len(self.local_dataset)))
         
         for epoch in range(epochs):
@@ -352,7 +347,7 @@ class VirtualClient:
                 context = self.rag_contexts[idx]
                 
                 messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": "You are a precise medical AI assistant. Answer the question as briefly and accurately as possible based on the provided retrieved knowledge. For yes/no questions, output only 'yes' or 'no'. For open-ended questions, output only the direct answer word or phrase without extra explanations."},
                     {"role": "user", "content": f"Retrieved Knowledge:\n{context}\n\nQuestion: {question}"}
                 ]
                 prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -446,7 +441,7 @@ def evaluate_dataset(shared_slm, dataset, rag_contexts, evaluator, question_type
         ground_truth = str(sample['answer']).lower()
         context = rag_contexts[i]
         
-        is_closed = ground_truth in ['yes', 'no'] or len(ground_truth.split()) <= 2
+        is_closed = (sample.get('answer_type', '').upper().strip() == 'CLOSED') if 'answer_type' in sample and sample['answer_type'] is not None else (ground_truth in ['yes', 'no'] or len(ground_truth.split()) <= 2)
         
         if question_type == "open" and is_closed:
             continue
@@ -475,39 +470,19 @@ def evaluate_dataset(shared_slm, dataset, rag_contexts, evaluator, question_type
     
     return evaluator.evaluate_closed_ended(closed_preds, closed_refs), evaluator.evaluate_open_ended(open_preds, open_refs), infer_time
 
-def format_rag_context(cases):
-    if not cases:
-        return "No highly relevant cases found."
-    return "\n".join([f"- Case (Similarity: {c['score']:.2f}): Question: {c['question']} | Answer: {c['answer']}" for c in cases])
-
-# --- HÀM XUẤT/LƯU KẾT QUẢ RA FILE CSV ---
-def append_results_to_csv(csv_path, row_data):
-    file_exists = os.path.exists(csv_path)
-    headers = [
-        "Timestamp", "Num_Clients", "Split_Type", "Alpha", "Rounds_Configured", "Actual_Rounds",
-        "Final_Avg_Loss", "Training_Time_Sec", "Val_Closed_Acc", "Val_Closed_F1",
-        "Test_Closed_Acc", "Test_Closed_F1", "Test_Open_BLEU", "Test_Open_ROUGE_L", "Inference_Time_Sec"
-    ]
-    
-    with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row_data)
-    print(f"[CSV Export] Results successfully appended to: {csv_path}")
-
-def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha, question_type="all", max_samples=None, results_dict=None):
-    print(f"\nSTARTING DECOUPLED FL (TEXT-ONLY WITH RAG): {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'}")
+def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha, question_type="all", max_samples=None):
+    print(f"\nSTARTING DECOUPLED FL (TEXT-ONLY WITH RAG): {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'} | Question Type = {question_type.upper()} | Max Samples = {max_samples if max_samples is not None else 'ALL'}")
     
     from datasets import concatenate_datasets
-    vqa_rad = load_dataset("flaviagiammarino/vqa-rad")
-    vqa_rad_full = concatenate_datasets([vqa_rad["train"], vqa_rad["test"]])
+    vqa_rad = load_dataset("mdwiratathya/SLAKE-vqa-english")
+    vqa_rad_full = concatenate_datasets([vqa_rad["train"], vqa_rad["validation"], vqa_rad["test"]])
     
     eval_seed = 42
     random.seed(eval_seed)
+    print(f"Using fixed dataset split seed: {eval_seed}")
     
     vqa_rad_full_shuffled = vqa_rad_full.shuffle(seed=eval_seed)
-    eval_size = 451
+    eval_size = min(451, int(0.2 * len(vqa_rad_full_shuffled)))
     vqa_rad_eval = vqa_rad_full_shuffled.select(range(eval_size))
     vqa_rad_train_val = vqa_rad_full_shuffled.select(range(eval_size, len(vqa_rad_full_shuffled)))
     
@@ -515,9 +490,12 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     vqa_rad_val = vqa_rad_train_val.select(range(val_size))
     vqa_rad_train = vqa_rad_train_val.select(range(val_size, len(vqa_rad_train_val)))
     
+    print(f"Dataset split: Train: {len(vqa_rad_train)}, Validation: {len(vqa_rad_val)}, Test: {len(vqa_rad_eval)}")
+    
     evaluator = MedVQAEvaluator()
     server = FederatedServer()
 
+    # Split Data
     splitter_seed_rad = 42
     splitter_rad = FederatedDataSplitter(vqa_rad_train, num_clients=num_clients, seed=splitter_seed_rad, question_type=question_type, max_samples=max_samples)
     if split_type == 'iid':
@@ -528,6 +506,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     total_samples_rad = sum(len(ds) for ds in client_datasets_rad)
     contributions_rad = {f"Hospital_{i+1}": round((len(ds) / total_samples_rad) * 100, 2) for i, ds in enumerate(client_datasets_rad)}
     
+    # Precompute RAG Contexts (BiomedCLIP)
     print("\n[RAG] Loading BiomedCLIP to precompute all FAISS indices and contexts...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     biomed_model_name = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
@@ -535,49 +514,57 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     biomed_tokenizer = open_clip.get_tokenizer(biomed_model_name)
     biomed_model.to(device).eval()
 
+    # Global Eval RAG
+    print("  Precomputing for Global Evaluation...")
     retriever_global = MedicalRetriever("global")
     retriever_global.build_index(vqa_rad_train, biomed_model, preprocess, biomed_tokenizer)
     eval_queries = retriever_global.compute_queries(vqa_rad_eval, biomed_model, preprocess, biomed_tokenizer)
     eval_rag_contexts = []
     for i in range(len(vqa_rad_eval)):
-        cases = retriever_global.search_cases(eval_queries[i], c=3, score_threshold=0.65)
-        eval_rag_contexts.append(format_rag_context(cases))
+        cases = retriever_global.search_cases(eval_queries[i], c=3)
+        ctx = "\n".join([f"- Question: {c['question']}\n  Answer: {c['answer']}" for c in cases])
+        eval_rag_contexts.append(ctx)
 
+    print("  Precomputing for Validation...")
     val_queries = retriever_global.compute_queries(vqa_rad_val, biomed_model, preprocess, biomed_tokenizer)
     val_rag_contexts = []
     for i in range(len(vqa_rad_val)):
-        cases = retriever_global.search_cases(val_queries[i], c=3, score_threshold=0.65)
-        val_rag_contexts.append(format_rag_context(cases))
+        cases = retriever_global.search_cases(val_queries[i], c=3)
+        ctx = "\n".join([f"- Question: {c['question']}\n  Answer: {c['answer']}" for c in cases])
+        val_rag_contexts.append(ctx)
 
+    # Client Local RAG
     client_rag_contexts = []
     for i, ds in enumerate(client_datasets_rad):
+        print(f"  Precomputing for Hospital {i+1}...")
         retriever_local = MedicalRetriever(f"client_{i}")
         local_embeds = retriever_local.build_index(ds, biomed_model, preprocess, biomed_tokenizer)
         rag_ctx = []
         for j in range(len(ds)):
-            cases = retriever_local.search_cases(local_embeds[j], c=3, avoid_self_idx=j, score_threshold=0.65)
-            rag_ctx.append(format_rag_context(cases))
+            cases = retriever_local.search_cases(local_embeds[j], c=3, avoid_self_idx=j)
+            ctx = "\n".join([f"- Question: {c['question']}\n  Answer: {c['answer']}" for c in cases])
+            rag_ctx.append(ctx)
         client_rag_contexts.append(rag_ctx)
 
+    # Free BiomedCLIP completely
     del biomed_model
-    clear_memory()
+    torch.cuda.empty_cache()
+    gc.collect()
+    print("\n[RAG] BiomedCLIP freed from GPU. Proceeding to load Qwen LLM...")
 
     os.makedirs("./data", exist_ok=True)
-    json_path = "./data/eval_results_k_clients_experiment.json"
-    csv_path = "./data/eval_results_k_clients_experiment.csv"
-
-    exp_key = f"{num_clients}_clients_{split_type.upper()}"
-    if results_dict is None:
-        results_dict = {}
-
-    results_dict[exp_key] = {
+    alpha_str = str(alpha) if split_type == 'non-iid' else "NA"
+    file_name = f"eval_results_{num_clients}clients_{num_rounds}rounds_{split_type.upper()}_a{alpha_str}_textonly_SLAKE.json"
+    json_path = os.path.join("./data", file_name)
+    
+    results_dict = {
         "Experiment_Config": {
             "Num_Clients": num_clients,
             "Max_Rounds_Configured": num_rounds,
             "Local_Epochs": epochs,
             "Split_Type": split_type.upper(),
             "Alpha": alpha if split_type == 'non-iid' else "NA",
-            "Model_Type": "Decoupled FL (Qwen2.5-1.5B) with Score-Filtered RAG"
+            "Model_Type": "Decoupled FL (Text-only Qwen) with RAG"
         },
         "Training_Stats": {},
         "Results": {
@@ -585,13 +572,13 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
         }
     }
 
-    def save_current_progress():
+    def save_current_progress(phase_name):
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(results_dict, f, indent=4, ensure_ascii=False)
-        print(f"Saved progress for [{exp_key}] to: {json_path}")
+        print(f"Saved progress '{phase_name}' to: {file_name}")
 
-    print("\n>>> INITIALIZING SHARED QWEN2.5-1.5B TEXT ENGINE...")
-    shared_slm = QwenMedVQA(model_id="Qwen/Qwen2.5-1.5B-Instruct", use_4bit=True)
+    print("\n>>> INITIALIZING SHARED QWEN TEXT ENGINE...")
+    shared_slm = QwenMedVQA(use_4bit=True)
     shared_slm.model = prepare_model_for_kbit_training(shared_slm.model)
     lora_config = LoraConfig(
         r=16, 
@@ -610,10 +597,10 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
         else:
             initial_lora_weights[k] = v.clone().cpu()
 
+    print(f"\n==================== EXPERIMENT: SLAKE ({num_clients} CLIENTS) ====================")
     shared_slm.model.load_state_dict(initial_lora_weights, strict=False)
     
-    alpha_str = str(alpha) if split_type == 'non-iid' else "NA"
-    checkpoint_rad = f"./model_checkpoints/lora_qwen1.5b_rad_{num_clients}clients_{num_rounds}rounds_{epochs}epochs_{split_type}_a{alpha_str}_textonly.pt"
+    checkpoint_slake = f"./model_checkpoints/lora_slake_{num_clients}clients_{num_rounds}rounds_{epochs}epochs_{split_type}_a{alpha_str}_textonly.pt"
     os.makedirs("./model_checkpoints", exist_ok=True)
 
     global_weights = None
@@ -626,9 +613,9 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     total_train_time_rad = 0.0
     start_train_time = time.time()
 
-    if os.path.exists(checkpoint_rad):
-        print(f"\n[LOAD] Found existing trained weights checkpoint: {checkpoint_rad}")
-        checkpoint = torch.load(checkpoint_rad, map_location='cpu')
+    if os.path.exists(checkpoint_slake):
+        print(f"\n[LOAD] Found existing trained weights checkpoint for SLAKE: {checkpoint_slake}")
+        checkpoint = torch.load(checkpoint_slake, map_location='cpu')
         if isinstance(checkpoint, dict) and 'weights' in checkpoint:
             global_weights = checkpoint['weights']
             start_round = checkpoint.get('round', num_rounds) + 1
@@ -642,6 +629,8 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
             print("Loading saved weights and skipping training...")
             actual_rounds = "Loaded from checkpoint"
             final_loss = best_loss if best_loss != float('inf') else 0.0
+        else:
+            print(f"Resuming training from Round {start_round}...")
 
     clients = []
     if start_round <= num_rounds:
@@ -650,7 +639,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
             clients.append(VirtualClient(f"Hospital_{i+1}", client_datasets_rad[i], client_rag_contexts[i], initial_client_weights))
             
         for round_num in range(start_round, num_rounds + 1):
-            print(f"  [VQA-RAD] Round {round_num}/{num_rounds}: Training...")
+            print(f"  [SLAKE] Round {round_num}/{num_rounds}: Training...")
             client_weights_list = []
             client_losses = []
             
@@ -668,7 +657,7 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
             avg_loss = sum(client_losses) / len(client_losses)
             final_loss = avg_loss
             actual_rounds = round_num
-            print(f"  [VQA-RAD] Round {round_num} Avg Loss: {avg_loss:.4f}")
+            print(f"  [SLAKE] Round {round_num} Avg Loss: {avg_loss:.4f}")
             
             if avg_loss < best_loss - 0.001:
                 best_loss = avg_loss
@@ -681,15 +670,16 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
                 'weights': global_weights,
                 'best_loss': best_loss,
                 'patience_counter': patience_counter
-            }, checkpoint_rad)
+            }, checkpoint_slake)
+            print(f"  [SLAKE] Auto-saved Round {round_num} checkpoint.")
 
             if patience_counter >= patience:
-                print(f"  [VQA-RAD] Early stopping triggered.")
+                print(f"  [SLAKE] Early stopping triggered.")
                 break
                 
         total_train_time_rad = round(time.time() - start_train_time, 2)
         
-    results_dict[exp_key]["Training_Stats"]["VQA-RAD"] = {
+    results_dict["Training_Stats"]["SLAKE"] = {
         "Client_Data_Contributions_Percent": contributions_rad,
         "Actual_Rounds_Run": actual_rounds,
         "Final_Average_Loss": round(final_loss, 4) if isinstance(final_loss, (int, float)) else final_loss,
@@ -697,80 +687,169 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     }
     
     shared_slm.model.load_state_dict(global_weights, strict=False)
-    print("\nEvaluating VQA-RAD Validation Set...")
+    print("\nEvaluating SLAKE Validation Set...")
     val_c, val_o, val_t = evaluate_dataset(shared_slm, vqa_rad_val, val_rag_contexts, evaluator, question_type=question_type)
-    results_dict[exp_key]["Results"]["Proposed (Fed+RAG)"]["VQA-RAD_Validation"] = format_scores_for_json(val_c, val_o, question_type=question_type)
+    results_dict["Results"]["Proposed (Fed+RAG)"]["SLAKE_Validation"] = format_scores_for_json(val_c, val_o, question_type=question_type)
 
-    print("\nEvaluating VQA-RAD Test Set (Decoupled Fed+RAG)...")
+    print("\nEvaluating SLAKE Test Set (Decoupled Fed+RAG)...")
     pv_c, pv_o, pv_t = evaluate_dataset(shared_slm, vqa_rad_eval, eval_rag_contexts, evaluator, question_type=question_type)
     
-    results_dict[exp_key]["Results"]["Proposed (Fed+RAG)"]["VQA-RAD_Test"] = format_scores_for_json(pv_c, pv_o, question_type=question_type)
-    results_dict[exp_key]["Results"]["Proposed (Fed+RAG)"]["Inference_Time_Seconds"] = round(pv_t, 2)
+    results_dict["Results"]["Proposed (Fed+RAG)"]["SLAKE_Test"] = format_scores_for_json(pv_c, pv_o, question_type=question_type)
+    results_dict["Results"]["Proposed (Fed+RAG)"]["Inference_Time_Seconds"] = round(pv_t, 2)
 
-    # Lưu tiến trình vào JSON
-    save_current_progress()
-
-    # BỔ SUNG: Chuẩn hóa dữ liệu dòng và xuất ra CSV
-    csv_row = {
-        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Num_Clients": num_clients,
-        "Split_Type": split_type.upper(),
-        "Alpha": alpha if split_type == 'non-iid' else "NA",
-        "Rounds_Configured": num_rounds,
-        "Actual_Rounds": actual_rounds,
-        "Final_Avg_Loss": round(final_loss, 4) if isinstance(final_loss, (int, float)) else final_loss,
-        "Training_Time_Sec": total_train_time_rad,
-        "Val_Closed_Acc": round(val_c.get('Accuracy', 0) * 100, 2),
-        "Val_Closed_F1": round(val_c.get('F1-Score', 0) * 100, 2),
-        "Test_Closed_Acc": round(pv_c.get('Accuracy', 0) * 100, 2),
-        "Test_Closed_F1": round(pv_c.get('F1-Score', 0) * 100, 2),
-        "Test_Open_BLEU": round(pv_o.get('BLEU', 0) * 100, 2),
-        "Test_Open_ROUGE_L": round(pv_o.get('ROUGE-L', 0) * 100, 2),
-        "Inference_Time_Sec": round(pv_t, 2)
-    }
-    append_results_to_csv(csv_path, csv_row)
+    save_current_progress("All Experiments Completed")
+    print(f"\nCOMPLETED! Evaluation metrics saved to: {json_path}")
 
     if 'clients' in locals():
         del clients
     del client_datasets_rad
     del shared_slm
     clear_memory()
+
     return results_dict
 
-def main():
-    k_list = [2, 3, 5, 10]
-    num_rounds = 10
-    epochs = 1
-    alpha = 0.5
-    question_type = "all"
-    max_samples = None
-    split_modes = ['iid', 'non-iid']
+def save_summary_csv(results_list, csv_path):
+    headers = [
+        "Num_Clients",
+        "Split_Type",
+        "Alpha",
+        "Max_Rounds",
+        "Actual_Rounds",
+        "Local_Epochs",
+        "Final_Avg_Loss",
+        "Training_Time_Sec",
+        "Val_Closed_Acc",
+        "Val_Closed_F1",
+        "Val_Open_BLEU",
+        "Val_Open_ROUGE_L",
+        "Test_Closed_Acc",
+        "Test_Closed_F1",
+        "Test_Open_BLEU",
+        "Test_Open_ROUGE_L",
+        "Inference_Time_Sec"
+    ]
+    
+    rows = []
+    for res in results_list:
+        cfg = res.get("Experiment_Config", {})
+        stats = res.get("Training_Stats", {}).get("SLAKE", {})
+        fed_res = res.get("Results", {}).get("Proposed (Fed+RAG)", {})
+        
+        val_c = fed_res.get("SLAKE_Validation", {}).get("Closed-Ended", {})
+        val_o = fed_res.get("SLAKE_Validation", {}).get("Open-Ended", {})
+        test_c = fed_res.get("SLAKE_Test", {}).get("Closed-Ended", {})
+        test_o = fed_res.get("SLAKE_Test", {}).get("Open-Ended", {})
+        
+        row = {
+            "Num_Clients": cfg.get("Num_Clients", ""),
+            "Split_Type": cfg.get("Split_Type", ""),
+            "Alpha": cfg.get("Alpha", ""),
+            "Max_Rounds": cfg.get("Max_Rounds_Configured", ""),
+            "Actual_Rounds": stats.get("Actual_Rounds_Run", ""),
+            "Local_Epochs": cfg.get("Local_Epochs", ""),
+            "Final_Avg_Loss": stats.get("Final_Average_Loss", ""),
+            "Training_Time_Sec": stats.get("Training_Time_Seconds", ""),
+            "Val_Closed_Acc": val_c.get("Accuracy", "N/A"),
+            "Val_Closed_F1": val_c.get("F1-Score", "N/A"),
+            "Val_Open_BLEU": val_o.get("BLEU", "N/A"),
+            "Val_Open_ROUGE_L": val_o.get("ROUGE-L", "N/A"),
+            "Test_Closed_Acc": test_c.get("Accuracy", "N/A"),
+            "Test_Closed_F1": test_c.get("F1-Score", "N/A"),
+            "Test_Open_BLEU": test_o.get("BLEU", "N/A"),
+            "Test_Open_ROUGE_L": test_o.get("ROUGE-L", "N/A"),
+            "Inference_Time_Sec": fed_res.get("Inference_Time_Seconds", "")
+        }
+        rows.append(row)
+        
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"\n[CSV Summary] All results aggregated and saved to: {csv_path}")
 
-    json_path = "./data/eval_results_k_clients_experiment.json"
-    results_dict = {}
-    if os.path.exists(json_path):
+def get_user_setup():
+    print("=== Federated Learning Multi-Client Simulation (SLAKE: 2 to 5 Clients) ===")
+    
+    while True:
         try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                results_dict = json.load(f)
-            print(f"[LOAD] Loaded existing results from {json_path}")
-        except Exception as e:
-            print(f"[WARN] Failed to load existing json: {e}")
+            num_rounds = int(input("1. Enter the max communication rounds (e.g., 5, 10, 20): "))
+            if num_rounds >= 1: break
+            else: print("At least 1 round is required!")
+        except ValueError: print("Please enter a valid integer!")
 
-    for k in k_list:
-        for split_mode in split_modes:
-            print("\n" + "="*80)
-            print(f"   STARTING EXPERIMENT LOOP: K = {k} CLIENTS | SPLIT = {split_mode.upper()}")
-            print("="*80)
-            results_dict = run_federated_simulation(
-                num_clients=k,
-                num_rounds=num_rounds,
-                epochs=epochs,
-                split_type=split_mode,
-                alpha=alpha,
-                question_type=question_type,
-                max_samples=max_samples,
-                results_dict=results_dict
-            )
+    while True:
+        try:
+            epochs = int(input("2. Enter local Epochs for each Hospital (e.g., 1, 2, 3 - 1 is recommended for speed/stability): "))
+            if epochs >= 1: break
+            else: print("At least 1 epoch is required!")
+        except ValueError: print("Please enter a valid integer!")
+
+    while True:
+        split_type = input("3. Select data splitting mode ('iid' or 'non-iid'): ").strip().lower()
+        if split_type in ['iid', 'non-iid']: break
+        else: print("Only 'iid' or 'non-iid' are accepted!")
+
+    alpha = 0.5 
+    if split_type == 'non-iid':
+        while True:
+            try:
+                alpha = float(input("4. Enter Alpha coefficient (e.g., 0.1 for extreme non-IID, 0.5 for moderate): "))
+                if alpha > 0: break
+                else: print("Alpha must be greater than 0!")
+            except ValueError: print("Please enter a valid float number!")
+
+    while True:
+        question_type = input("5. Select question type to train on ('all', 'closed', 'open'): ").strip().lower()
+        if question_type in ['all', 'closed', 'open']: break
+        else: print("Only 'all', 'closed', or 'open' are accepted!")
+
+    max_samples = None
+    while True:
+        max_samples_input = input("6. Enter max training samples per dataset (e.g., 1000, or press Enter for all): ").strip()
+        if max_samples_input == "":
+            max_samples = None
+            break
+        try:
+            max_samples = int(max_samples_input)
+            if max_samples >= 1: break
+            else: print("Must be at least 1!")
+        except ValueError:
+            print("Please enter a valid integer or press Enter!")
+
+    return num_rounds, epochs, split_type, alpha, question_type, max_samples
 
 if __name__ == "__main__":
-    main()
+    rounds_input, epochs_input, split_input, alpha_input, qtype_input, max_samples_input = get_user_setup()
+    
+    alpha_str = str(alpha_input) if split_input == 'non-iid' else "NA"
+    csv_filename = f"summary_results_2to5clients_{split_input.upper()}_a{alpha_str}_SLAKE.csv"
+    csv_path = os.path.join("./data", csv_filename)
+    
+    all_experiment_results = []
+    
+    for k in range(2, 6): # Automate for 2, 3, 4, 5 clients
+        print(f"\n==================================================================")
+        print(f"   STARTING SIMULATION FOR K = {k} CLIENTS")
+        print(f"==================================================================")
+        
+        results_dict = run_federated_simulation(
+            num_clients=k,
+            num_rounds=rounds_input,
+            epochs=epochs_input,
+            split_type=split_input,
+            alpha=alpha_input,
+            question_type=qtype_input,
+            max_samples=max_samples_input
+        )
+        all_experiment_results.append(results_dict)
+        
+        # Save CSV summary after each iteration so progress is saved incrementally
+        save_summary_csv(all_experiment_results, csv_path)
+        
+        clear_memory()
+        
+    print(f"\n==================================================================")
+    print(f"   ALL EXPERIMENTS (2 TO 5 CLIENTS) COMPLETED SUCCESSFULLY!")
+    print(f"   Summary CSV saved at: {csv_path}")
+    print(f"==================================================================")

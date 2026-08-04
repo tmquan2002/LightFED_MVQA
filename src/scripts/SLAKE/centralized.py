@@ -9,7 +9,7 @@ import warnings
 import faiss
 import numpy as np
 import torch.nn as nn
-from datasets import load_dataset, Dataset, concatenate_datasets
+from datasets import load_dataset, Dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, get_peft_model_state_dict
 from sklearn.metrics import f1_score
 from PIL import Image
@@ -143,9 +143,9 @@ class MedicalRetriever:
                 break
         return results
 
-# --- src/models/qwen_slm.py (text-only variant) ---
+# --- src/models/qwen_slm.py ---
 class QwenMedVQA:
-    def __init__(self, model_id="Qwen/Qwen2.5-1.5B-Instruct", use_4bit=True):
+    def __init__(self, model_id="Qwen/Qwen2.5-0.5B-Instruct", use_4bit=True):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         quantization_config = None
@@ -191,13 +191,6 @@ class QwenMedVQA:
         raw_ans = self.tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=True).strip()
         return raw_ans
 
-# --- utilities ---
-def is_closed_ended(item) -> bool:
-    if 'answer_type' in item and item['answer_type'] is not None:
-        return str(item['answer_type']).upper().strip() == 'CLOSED'
-    ans = str(item.get('answer', '')).lower().strip()
-    return ans in ['yes', 'no'] or len(ans.split()) <= 2
-
 def clear_memory():
     gc.collect()
     if torch.cuda.is_available():
@@ -229,18 +222,17 @@ def evaluate_dataset(shared_slm, dataset, rag_contexts, evaluator, question_type
         ground_truth = str(sample['answer']).lower()
         context = rag_contexts[i]
         
-        sample_is_closed = (sample.get('answer_type', '').upper().strip() == 'CLOSED') if 'answer_type' in sample and sample['answer_type'] is not None else (ground_truth in ['yes', 'no'] or len(ground_truth.split()) <= 2)
+        is_closed = (sample.get('answer_type', '').upper().strip() == 'CLOSED') if 'answer_type' in sample and sample['answer_type'] is not None else (ground_truth in ['yes', 'no'] or len(ground_truth.split()) <= 2)
         
-        if question_type == "open" and sample_is_closed:
+        if question_type == "open" and is_closed:
             continue
-        elif question_type == "closed" and not sample_is_closed:
+        elif question_type == "closed" and not is_closed:
             continue
             
         pred = shared_slm.predict(question, context=context)
         pred_normalized = pred.strip().lower()
         
-        # Normalize closed-ended predictions to exactly 'yes' or 'no'
-        if sample_is_closed:
+        if is_closed:
             first_word = pred_normalized.split()[0].strip('.,!?;:') if pred_normalized.split() else pred_normalized
             if first_word in ('yes', 'no'):
                 pred_normalized = first_word
@@ -249,7 +241,7 @@ def evaluate_dataset(shared_slm, dataset, rag_contexts, evaluator, question_type
             elif 'no' in pred_normalized:
                 pred_normalized = 'no'
         
-        if sample_is_closed:
+        if is_closed:
             closed_preds.append(pred_normalized); closed_refs.append(ground_truth)
         else:
             open_preds.append(pred_normalized); open_refs.append(ground_truth)
@@ -260,8 +252,9 @@ def evaluate_dataset(shared_slm, dataset, rag_contexts, evaluator, question_type
     return evaluator.evaluate_closed_ended(closed_preds, closed_refs), evaluator.evaluate_open_ended(open_preds, open_refs), infer_time
 
 def run_centralized_training(epochs, question_type="all", max_samples=None):
-    print(f"\nSTARTING CENTRALIZED TRAINING (TEXT-ONLY WITH RAG): {epochs} Epochs | Question Type = {question_type.upper()} | Max Samples = {max_samples if max_samples is not None else 'ALL'}")
+    print(f"\nSTARTING CENTRALIZED BASELINE TRAINING (TEXT-ONLY WITH RAG): {epochs} Epochs | Question Type = {question_type.upper()} | Max Samples = {max_samples if max_samples is not None else 'ALL'}")
     
+    from datasets import concatenate_datasets
     vqa_rad = load_dataset("mdwiratathya/SLAKE-vqa-english")
     vqa_rad_full = concatenate_datasets([vqa_rad["train"], vqa_rad["validation"], vqa_rad["test"]])
     
@@ -278,66 +271,61 @@ def run_centralized_training(epochs, question_type="all", max_samples=None):
     vqa_rad_val = vqa_rad_train_val.select(range(val_size))
     vqa_rad_train = vqa_rad_train_val.select(range(val_size, len(vqa_rad_train_val)))
     
-    print(f"Dataset split: Train: {len(vqa_rad_train)}, Validation: {len(vqa_rad_val)}, Test: {len(vqa_rad_eval)}")
+    # Filter question type if requested
+    if question_type in ["closed", "open"]:
+        def is_closed(item):
+            if 'answer_type' in item and item['answer_type'] is not None:
+                return str(item['answer_type']).upper().strip() == 'CLOSED'
+            ans = str(item.get('answer', '')).lower().strip()
+            return ans in ['yes', 'no'] or len(ans.split()) <= 2
+            
+        indices = [idx for idx, item in enumerate(vqa_rad_train) if (question_type == "closed" and is_closed(item)) or (question_type == "open" and not is_closed(item))]
+        vqa_rad_train = vqa_rad_train.select(indices)
+        
+    if max_samples is not None:
+        vqa_rad_train = vqa_rad_train.select(range(min(max_samples, len(vqa_rad_train))))
+        
+    print(f"Centralized Dataset split: Train: {len(vqa_rad_train)}, Validation: {len(vqa_rad_val)}, Test: {len(vqa_rad_eval)}")
     
     evaluator = MedVQAEvaluator()
 
-    # Filter train dataset by question type and max_samples
-    if question_type in ["closed", "open"]:
-        indices = []
-        for idx, item in enumerate(vqa_rad_train):
-            is_closed = is_closed_ended(item)
-            if question_type == "closed" and is_closed:
-                indices.append(idx)
-            elif question_type == "open" and not is_closed:
-                indices.append(idx)
-        vqa_rad_train = vqa_rad_train.select(indices)
-        print(f"[Dataset] Filtered train dataset to {question_type} questions: {len(indices)} samples.")
-        
-    if max_samples is not None and len(vqa_rad_train) > max_samples:
-        vqa_rad_train = vqa_rad_train.select(range(max_samples))
-        print(f"[Dataset] Limited train dataset to {len(vqa_rad_train)} samples (max_samples={max_samples}).")
-        
-    # Precompute RAG Contexts (BiomedCLIP)
-    print("\n[RAG] Loading BiomedCLIP to precompute all FAISS indices and contexts...")
+    # Precompute RAG Contexts (BiomedCLIP) using central training set
+    print("\n[RAG] Loading BiomedCLIP to precompute central FAISS index and contexts...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     biomed_model_name = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
     biomed_model, preprocess = open_clip.create_model_from_pretrained(biomed_model_name)
     biomed_tokenizer = open_clip.get_tokenizer(biomed_model_name)
     biomed_model.to(device).eval()
 
-    # Build Central Index on Train set
-    print("  Building FAISS index on Central Train Set...")
-    retriever_train = MedicalRetriever("central_train")
-    train_embeds = retriever_train.build_index(vqa_rad_train, biomed_model, preprocess, biomed_tokenizer)
-
-    # Train RAG Contexts (avoid self)
-    print("  Precomputing RAG contexts for Training Set...")
+    # Build Global Index on Training Data
+    print("  Building Central Training FAISS Index...")
+    retriever_central = MedicalRetriever("central")
+    train_embeds = retriever_central.build_index(vqa_rad_train, biomed_model, preprocess, biomed_tokenizer)
+    
+    print("  Precomputing Training RAG Contexts...")
     train_rag_contexts = []
     for j in range(len(vqa_rad_train)):
-        cases = retriever_train.search_cases(train_embeds[j], c=3, avoid_self_idx=j)
+        cases = retriever_central.search_cases(train_embeds[j], c=3, avoid_self_idx=j)
         ctx = "\n".join([f"- Question: {c['question']}\n  Answer: {c['answer']}" for c in cases])
         train_rag_contexts.append(ctx)
 
-    # Global Test RAG Contexts
-    print("  Precomputing RAG contexts for Test Evaluation...")
-    eval_queries = retriever_train.compute_queries(vqa_rad_eval, biomed_model, preprocess, biomed_tokenizer)
+    print("  Precomputing Global Evaluation RAG Contexts...")
+    eval_queries = retriever_central.compute_queries(vqa_rad_eval, biomed_model, preprocess, biomed_tokenizer)
     eval_rag_contexts = []
     for i in range(len(vqa_rad_eval)):
-        cases = retriever_train.search_cases(eval_queries[i], c=3)
+        cases = retriever_central.search_cases(eval_queries[i], c=3)
         ctx = "\n".join([f"- Question: {c['question']}\n  Answer: {c['answer']}" for c in cases])
         eval_rag_contexts.append(ctx)
 
-    # Validation RAG Contexts
-    print("  Precomputing RAG contexts for Validation...")
-    val_queries = retriever_train.compute_queries(vqa_rad_val, biomed_model, preprocess, biomed_tokenizer)
+    print("  Precomputing Validation RAG Contexts...")
+    val_queries = retriever_central.compute_queries(vqa_rad_val, biomed_model, preprocess, biomed_tokenizer)
     val_rag_contexts = []
     for i in range(len(vqa_rad_val)):
-        cases = retriever_train.search_cases(val_queries[i], c=3)
+        cases = retriever_central.search_cases(val_queries[i], c=3)
         ctx = "\n".join([f"- Question: {c['question']}\n  Answer: {c['answer']}" for c in cases])
         val_rag_contexts.append(ctx)
 
-    # Free BiomedCLIP memory
+    # Free BiomedCLIP completely
     del biomed_model
     torch.cuda.empty_cache()
     gc.collect()
@@ -349,22 +337,16 @@ def run_centralized_training(epochs, question_type="all", max_samples=None):
     
     results_dict = {
         "Experiment_Config": {
-            "Training_Type": "Centralized",
-            "Epochs": epochs,
+            "Model_Type": "Centralized Baseline (Text-only Qwen) with RAG",
+            "Total_Epochs": epochs,
             "Question_Type": question_type.upper(),
-            "Max_Samples": max_samples if max_samples is not None else "ALL",
-            "Model_Type": "Centralized (Text-only Qwen) with RAG"
+            "Max_Samples": max_samples if max_samples is not None else "ALL"
         },
         "Training_Stats": {},
         "Results": {
-            "Centralized (SLAKE+RAG)": {}
+            "Centralized": {}
         }
     }
-
-    def save_current_progress(phase_name):
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(results_dict, f, indent=4, ensure_ascii=False)
-        print(f"Saved progress '{phase_name}' to: {file_name}")
 
     print("\n>>> INITIALIZING SHARED QWEN TEXT ENGINE...")
     slm = QwenMedVQA(use_4bit=True)
@@ -379,36 +361,27 @@ def run_centralized_training(epochs, question_type="all", max_samples=None):
     )
     slm.model = get_peft_model(slm.model, lora_config)
     
-    import torch.optim as optim
-    
-    checkpoint_path = f"./model_checkpoints/lora_centralized_{epochs}epochs_{question_type}_textonly_SLAKE.pt"
+    checkpoint_centralized = f"./model_checkpoints/lora_slake_centralized_{epochs}epochs_{question_type}_textonly.pt"
     os.makedirs("./model_checkpoints", exist_ok=True)
 
-    model = slm.model
-    tokenizer = slm.tokenizer
-    device = slm.device
-
-    best_loss = float('inf')
-    patience = 3
-    patience_counter = 0
-    total_train_time = 0.0
-    final_avg_loss = 0.0
     start_train_time = time.time()
-
-    if os.path.exists(checkpoint_path):
-        print(f"\n[LOAD] Found existing trained weights checkpoint for SLAKE Centralized: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        if isinstance(checkpoint, dict) and 'weights' in checkpoint:
-            model.load_state_dict(checkpoint['weights'], strict=False)
-            best_loss = checkpoint.get('best_loss', float('inf'))
-            final_avg_loss = best_loss if best_loss != float('inf') else 0.0
-        else:
-            model.load_state_dict(checkpoint, strict=False)
-        print("Loaded saved weights from checkpoint, skipping training...")
+    total_loss = 0.0
+    final_loss = 0.0
+    
+    if os.path.exists(checkpoint_centralized):
+        print(f"\n[LOAD] Found existing central trained weights checkpoint: {checkpoint_centralized}")
+        checkpoint = torch.load(checkpoint_centralized, map_location='cpu')
+        weights = checkpoint.get('weights', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        slm.model.load_state_dict(weights, strict=False)
+        print("Loaded saved central model weights, skipping training phase.")
+        total_train_time = 0.0
+        final_loss = checkpoint.get('loss', 0.0) if isinstance(checkpoint, dict) else 0.0
     else:
-        print(f"\n==================== EXPERIMENT: SLAKE Centralized Training ====================")
-        model.train()
-        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
+        print(f"\n==================== CENTRALIZED TRAINING: SLAKE ====================")
+        import torch.optim as optim
+        
+        slm.model.train()
+        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, slm.model.parameters()), lr=1e-4)
         scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
         
         accumulation_steps = 4
@@ -416,7 +389,7 @@ def run_centralized_training(epochs, question_type="all", max_samples=None):
         
         for epoch in range(epochs):
             random.shuffle(indices)
-            total_loss = 0.0
+            epoch_loss = 0.0
             steps = 0
             optimizer.zero_grad()
             
@@ -430,10 +403,10 @@ def run_centralized_training(epochs, question_type="all", max_samples=None):
                     {"role": "system", "content": "You are a precise medical AI assistant. Answer the question as briefly and accurately as possible based on the provided retrieved knowledge. For yes/no questions, output only 'yes' or 'no'. For open-ended questions, output only the direct answer word or phrase without extra explanations."},
                     {"role": "user", "content": f"Retrieved Knowledge:\n{context}\n\nQuestion: {question}"}
                 ]
-                prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                prompt = slm.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                 
-                prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
-                answer_ids = tokenizer.encode(answer, add_special_tokens=False) + [tokenizer.eos_token_id]
+                prompt_ids = slm.tokenizer.encode(prompt, add_special_tokens=False)
+                answer_ids = slm.tokenizer.encode(answer, add_special_tokens=False) + [slm.tokenizer.eos_token_id]
                 
                 input_ids = prompt_ids + answer_ids
                 labels = [-100] * len(prompt_ids) + answer_ids
@@ -444,96 +417,85 @@ def run_centralized_training(epochs, question_type="all", max_samples=None):
                     labels = labels[:max_length]
                 
                 inputs = {
-                    "input_ids": torch.tensor([input_ids]).to(device),
-                    "attention_mask": torch.tensor([[1]*len(input_ids)]).to(device),
-                    "labels": torch.tensor([labels]).to(device)
+                    "input_ids": torch.tensor([input_ids]).to(slm.device),
+                    "attention_mask": torch.tensor([[1]*len(input_ids)]).to(slm.device),
+                    "labels": torch.tensor([labels]).to(slm.device)
                 }
                 
                 if scaler is not None:
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16):
-                        outputs = model(**inputs)
+                        outputs = slm.model(**inputs)
                         loss = outputs.loss / accumulation_steps
                     scaler.scale(loss).backward()
                     
                     if (i + 1) % accumulation_steps == 0 or (i + 1) == len(indices):
                         scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        torch.nn.utils.clip_grad_norm_(slm.model.parameters(), 1.0)
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad()
                 else:
-                    outputs = model(**inputs)
+                    outputs = slm.model(**inputs)
                     loss = outputs.loss / accumulation_steps
                     loss.backward()
                     
                     if (i + 1) % accumulation_steps == 0 or (i + 1) == len(indices):
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        torch.nn.utils.clip_grad_norm_(slm.model.parameters(), 1.0)
                         optimizer.step()
                         optimizer.zero_grad()
                 
-                total_loss += loss.item() * accumulation_steps
+                epoch_loss += loss.item() * accumulation_steps
                 steps += 1
                 
-                if i % 10 == 0:
+                if i % 20 == 0:
                     print(f"    Epoch {epoch+1}/{epochs} | Step {i}/{len(indices)} | Loss: {loss.item() * accumulation_steps:.4f}   ", end="\r")
                     
-            print()
-            avg_loss = total_loss / steps if steps > 0 else 0.0
-            final_avg_loss = avg_loss
-            print(f"  [SLAKE Centralized] Epoch {epoch+1}/{epochs} Avg Loss: {avg_loss:.4f}")
+            avg_epoch_loss = epoch_loss / steps if steps > 0 else 0.0
+            final_loss = avg_epoch_loss
+            print(f"\n  [Centralized] Epoch {epoch+1}/{epochs} Completed | Avg Loss: {avg_epoch_loss:.4f}")
             
-            if avg_loss < best_loss - 0.001:
-                best_loss = avg_loss
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                
-            raw_weights = get_peft_model_state_dict(model)
-            clean_weights = {}
-            for name, param in raw_weights.items():
-                if getattr(param, "device", None) and param.device.type == 'meta':
-                    clean_weights[name] = torch.zeros(param.shape, dtype=param.dtype, device='cpu')
-                else:
-                    clean_weights[name] = param.clone().detach().cpu()
-                    
-            torch.save({
-                'epoch': epoch + 1,
-                'weights': clean_weights,
-                'best_loss': best_loss,
-                'patience_counter': patience_counter
-            }, checkpoint_path)
-            print(f"  [SLAKE Centralized] Auto-saved Epoch {epoch+1} checkpoint.")
-
-            if patience_counter >= patience:
-                print(f"  [SLAKE Centralized] Early stopping triggered.")
-                break
-                
         total_train_time = round(time.time() - start_train_time, 2)
         
-    results_dict["Training_Stats"]["SLAKE"] = {
-        "Total_Train_Samples": len(vqa_rad_train),
-        "Final_Average_Loss": round(final_avg_loss, 4) if isinstance(final_avg_loss, (int, float)) else final_avg_loss,
+        # Save central model state dict
+        raw_weights = get_peft_model_state_dict(slm.model)
+        clean_weights = {}
+        for k, v in raw_weights.items():
+            clean_weights[k] = v.clone().cpu()
+            
+        torch.save({'weights': clean_weights, 'loss': final_loss}, checkpoint_centralized)
+        print(f"Saved central baseline model weights to: {checkpoint_centralized}")
+        
+    results_dict["Training_Stats"]["SLAKE_Centralized"] = {
+        "Total_Samples_Trained": len(vqa_rad_train),
+        "Final_Average_Loss": round(final_loss, 4),
         "Training_Time_Seconds": total_train_time
     }
-    
-    print("\nEvaluating SLAKE Validation Set...")
-    val_c, val_o, val_t = evaluate_dataset(slm, vqa_rad_val, val_rag_contexts, evaluator, question_type=question_type)
-    results_dict["Results"]["Centralized (SLAKE+RAG)"]["SLAKE_Validation"] = format_scores_for_json(val_c, val_o, question_type=question_type)
 
-    print("\nEvaluating SLAKE Test Set (Centralized+RAG)...")
+    print("\nEvaluating Centralized Model on SLAKE Validation Set...")
+    val_c, val_o, val_t = evaluate_dataset(slm, vqa_rad_val, val_rag_contexts, evaluator, question_type=question_type)
+    results_dict["Results"]["Centralized"]["SLAKE_Validation"] = format_scores_for_json(val_c, val_o, question_type=question_type)
+
+    print("\nEvaluating Centralized Model on SLAKE Test Set...")
     pv_c, pv_o, pv_t = evaluate_dataset(slm, vqa_rad_eval, eval_rag_contexts, evaluator, question_type=question_type)
     
-    results_dict["Results"]["Centralized (SLAKE+RAG)"]["SLAKE_Test"] = format_scores_for_json(pv_c, pv_o, question_type=question_type)
-    results_dict["Results"]["Centralized (SLAKE+RAG)"]["Inference_Time_Seconds"] = round(pv_t, 2)
+    results_dict["Results"]["Centralized"]["SLAKE_Test"] = format_scores_for_json(pv_c, pv_o, question_type=question_type)
+    results_dict["Results"]["Centralized"]["Inference_Time_Seconds"] = round(pv_t, 2)
 
-    save_current_progress("All Experiments Completed")
-    print(f"\nCOMPLETED! Evaluation metrics saved to: {json_path}")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(results_dict, f, indent=4, ensure_ascii=False)
+        
+    print(f"\nCENTRALIZED EXPERIMENT COMPLETED! Results saved to: {json_path}")
+    
+    del slm
     clear_memory()
+    return results_dict
 
 def get_user_setup():
+    print("=== Centralized Baseline Model Setup (SLAKE Single Server) ===")
+    
     while True:
         try:
-            epochs = int(input("\n1. Enter training Epochs (e.g., 1, 2, 3 - 1 is recommended for speed/stability): "))
+            epochs = int(input("1. Enter total training Epochs (e.g., 5, 10, 20): "))
             if epochs >= 1: break
             else: print("At least 1 epoch is required!")
         except ValueError: print("Please enter a valid integer!")
@@ -545,7 +507,7 @@ def get_user_setup():
 
     max_samples = None
     while True:
-        max_samples_input = input("3. Enter max training samples per dataset (e.g., 1000, or press Enter for all): ").strip()
+        max_samples_input = input("3. Enter max training samples (e.g., 1000, or press Enter for all): ").strip()
         if max_samples_input == "":
             max_samples = None
             break
@@ -560,4 +522,4 @@ def get_user_setup():
 
 if __name__ == "__main__":
     epochs_input, qtype_input, max_samples_input = get_user_setup()
-    run_centralized_training(epochs_input, question_type=qtype_input, max_samples=max_samples_input)
+    run_centralized_training(epochs=epochs_input, question_type=qtype_input, max_samples=max_samples_input)
