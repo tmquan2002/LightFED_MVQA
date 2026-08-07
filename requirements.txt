@@ -2,9 +2,9 @@
 --extra-index-url https://pypi.org/simple
 
 # Deep Learning Core
-torch==2.6.0
-torchvision==0.21.0
-torchaudio==2.6.0
+torch>=2.9.0
+torchvision>=0.24.0
+torchaudio>=2.9.0
 
 # Multimodal & LLM/SLM
 transformers>=4.48.0
@@ -17,7 +17,7 @@ av
 # RAG & Vector Search
 faiss-cpu
 scikit-learn
-numpy>=1.24.0,<2.0.0
+numpy>=1.24.0
 open-clip-torch
 timm
 

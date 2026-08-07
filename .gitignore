@@ -9,3 +9,4 @@ data/
 .env
 .ipynb_checkpoints/
 .venv/
+model_checkpoints/
