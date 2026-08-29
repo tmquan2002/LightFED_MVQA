@@ -485,7 +485,83 @@ def format_rag_context(cases):
         return "No highly relevant cases found."
     return "\n".join([f"- Case (Similarity: {c['score']:.2f}): Question: {c['question']} | Answer: {c['answer']}" for c in cases])
 
-def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha, question_type="all", max_samples=None, results_dict=None):
+def save_result_to_csv(csv_path, row_dict):
+    headers = [
+        "Num_Clients",
+        "Split_Type",
+        "Alpha",
+        "Max_Rounds",
+        "Actual_Rounds",
+        "Local_Epochs",
+        "Final_Avg_Loss",
+        "Training_Time_Sec",
+        "Val_Closed_Acc",
+        "Val_Closed_F1",
+        "Val_Open_BLEU",
+        "Val_Open_ROUGE_L",
+        "Test_Closed_Acc",
+        "Test_Closed_F1",
+        "Test_Open_BLEU",
+        "Test_Open_ROUGE_L",
+        "Inference_Time_Sec"
+    ]
+    
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    file_exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
+    
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row_dict)
+        f.flush()
+        os.fsync(f.fileno())
+    print(f"\n[CSV Summary] Result saved directly to: {csv_path}")
+
+def save_round_progress_to_csv(csv_path, row_dict):
+    headers = [
+        "Num_Clients",
+        "Split_Type",
+        "Alpha",
+        "Round",
+        "Max_Rounds",
+        "Avg_Loss",
+        "Best_Loss",
+        "Patience_Counter",
+        "Timestamp"
+    ]
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    file_exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row_dict)
+        f.flush()
+        os.fsync(f.fileno())
+
+def is_experiment_in_csv(csv_path, num_clients, split_type, alpha):
+    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+        return False
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            target_alpha = str(alpha) if split_type.lower() == 'non-iid' else "NA"
+            for row in reader:
+                try:
+                    c_num = int(row.get("Num_Clients", -1))
+                    c_split = str(row.get("Split_Type", "")).upper()
+                    c_alpha = str(row.get("Alpha", ""))
+                    
+                    if c_num == num_clients and c_split == split_type.upper() and c_alpha == target_alpha:
+                        return True
+                except ValueError:
+                    continue
+    except Exception as e:
+        print(f"[WARN] Error reading {csv_path}: {e}")
+    return False
+
+def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha, question_type="all", max_samples=None, csv_path="./data/summary_results_clients_textonly_VQA-RAD.csv"):
     print(f"\nSTARTING DECOUPLED FL (TEXT-ONLY WITH RAG): {num_clients} Clients | {num_rounds} Rounds | {epochs} Epochs | {split_type.upper()} | Alpha = {alpha if split_type == 'non-iid' else 'NA'} | Question Type = {question_type.upper()} | Max Samples = {max_samples if max_samples is not None else 'ALL'}")
     
     from datasets import concatenate_datasets
@@ -552,34 +628,6 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
     clear_memory()
 
     os.makedirs("./data", exist_ok=True)
-    alpha_str = str(alpha) if split_type == 'non-iid' else "NA"
-    json_path = f"./data/eval_results_{num_clients}_clients_textonly_VQA-RAD.json"
-    csv_path = f"./data/summary_results_{num_clients}_clients_textonly_VQA-RAD.csv"
-
-    exp_key = f"{num_clients}_clients_{split_type.upper()}_a{alpha_str}" if split_type == 'non-iid' else f"{num_clients}_clients_{split_type.upper()}"
-    if results_dict is None:
-        results_dict = {}
-
-    results_dict[exp_key] = {
-        "Experiment_Config": {
-            "Num_Clients": num_clients,
-            "Max_Rounds_Configured": num_rounds,
-            "Local_Epochs": epochs,
-            "Split_Type": split_type.upper(),
-            "Alpha": alpha if split_type == 'non-iid' else "NA",
-            "Model_Type": "Decoupled FL (Qwen2.5-1.5B) with Score-Filtered RAG"
-        },
-        "Training_Stats": {},
-        "Results": {
-            "Proposed (Fed+RAG)": {}
-        }
-    }
-
-    def save_current_progress():
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(results_dict, f, indent=4, ensure_ascii=False)
-        print(f"Saved progress for [{exp_key}] to: {json_path}")
-        save_summary_csv(results_dict, csv_path)
 
     print("\n>>> INITIALIZING SHARED QWEN2.5-1.5B TEXT ENGINE...")
     shared_slm = QwenMedVQA(model_id="Qwen/Qwen2.5-1.5B-Instruct", use_4bit=True)
@@ -674,127 +722,75 @@ def run_federated_simulation(num_clients, num_rounds, epochs, split_type, alpha,
                 'patience_counter': patience_counter
             }, checkpoint_rad)
 
+            save_round_progress_to_csv("./data/intermediate_round_logs_VQA-RAD.csv", {
+                "Num_Clients": num_clients,
+                "Split_Type": split_type.upper(),
+                "Alpha": alpha if split_type == 'non-iid' else "NA",
+                "Round": round_num,
+                "Max_Rounds": num_rounds,
+                "Avg_Loss": round(avg_loss, 4),
+                "Best_Loss": round(best_loss, 4) if best_loss != float('inf') else "N/A",
+                "Patience_Counter": patience_counter,
+                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+
             if patience_counter >= patience:
                 print(f"  [VQA-RAD] Early stopping triggered.")
                 break
                 
         total_train_time_rad = round(time.time() - start_train_time, 2)
-        
-    results_dict[exp_key]["Training_Stats"]["VQA-RAD"] = {
-        "Client_Data_Contributions_Percent": contributions_rad,
-        "Actual_Rounds_Run": actual_rounds,
-        "Final_Average_Loss": round(final_loss, 4) if isinstance(final_loss, (int, float)) else final_loss,
-        "Training_Time_Seconds": total_train_time_rad
-    }
-    
+
     shared_slm.model.load_state_dict(global_weights, strict=False)
     print("\nEvaluating VQA-RAD Validation Set...")
     val_c, val_o, val_t = evaluate_dataset(shared_slm, vqa_rad_val, val_rag_contexts, evaluator, question_type=question_type)
-    results_dict[exp_key]["Results"]["Proposed (Fed+RAG)"]["VQA-RAD_Validation"] = format_scores_for_json(val_c, val_o, question_type=question_type)
 
     print("\nEvaluating VQA-RAD Test Set (Decoupled Fed+RAG)...")
     pv_c, pv_o, pv_t = evaluate_dataset(shared_slm, vqa_rad_eval, eval_rag_contexts, evaluator, question_type=question_type)
-    
-    results_dict[exp_key]["Results"]["Proposed (Fed+RAG)"]["VQA-RAD_Test"] = format_scores_for_json(pv_c, pv_o, question_type=question_type)
-    results_dict[exp_key]["Results"]["Proposed (Fed+RAG)"]["Inference_Time_Seconds"] = round(pv_t, 2)
 
-    save_current_progress()
+    row = {
+        "Num_Clients": num_clients,
+        "Split_Type": split_type.upper(),
+        "Alpha": alpha if split_type == 'non-iid' else "NA",
+        "Max_Rounds": num_rounds,
+        "Actual_Rounds": actual_rounds,
+        "Local_Epochs": epochs,
+        "Final_Avg_Loss": round(final_loss, 4) if isinstance(final_loss, (int, float)) else final_loss,
+        "Training_Time_Sec": total_train_time_rad,
+        "Val_Closed_Acc": round(val_c.get('Accuracy', 0) * 100, 1) if question_type in ["all", "closed"] else "N/A",
+        "Val_Closed_F1": round(val_c.get('F1-Score', 0) * 100, 1) if question_type in ["all", "closed"] else "N/A",
+        "Val_Open_BLEU": round(val_o.get('BLEU', 0) * 100, 1) if question_type in ["all", "open"] else "N/A",
+        "Val_Open_ROUGE_L": round(val_o.get('ROUGE-L', 0) * 100, 1) if question_type in ["all", "open"] else "N/A",
+        "Test_Closed_Acc": round(pv_c.get('Accuracy', 0) * 100, 1) if question_type in ["all", "closed"] else "N/A",
+        "Test_Closed_F1": round(pv_c.get('F1-Score', 0) * 100, 1) if question_type in ["all", "closed"] else "N/A",
+        "Test_Open_BLEU": round(pv_o.get('BLEU', 0) * 100, 1) if question_type in ["all", "open"] else "N/A",
+        "Test_Open_ROUGE_L": round(pv_o.get('ROUGE-L', 0) * 100, 1) if question_type in ["all", "open"] else "N/A",
+        "Inference_Time_Sec": round(pv_t, 2)
+    }
+
+    save_result_to_csv(csv_path, row)
 
     if 'clients' in locals():
         del clients
     del client_datasets_rad
     del shared_slm
     clear_memory()
-    return results_dict
-
-def save_summary_csv(results_dict, csv_path):
-    headers = [
-        "Num_Clients",
-        "Split_Type",
-        "Alpha",
-        "Max_Rounds",
-        "Actual_Rounds",
-        "Local_Epochs",
-        "Final_Avg_Loss",
-        "Training_Time_Sec",
-        "Val_Closed_Acc",
-        "Val_Closed_F1",
-        "Val_Open_BLEU",
-        "Val_Open_ROUGE_L",
-        "Test_Closed_Acc",
-        "Test_Closed_F1",
-        "Test_Open_BLEU",
-        "Test_Open_ROUGE_L",
-        "Inference_Time_Sec"
-    ]
-    
-    rows = []
-    for exp_key, exp_data in results_dict.items():
-        if not isinstance(exp_data, dict):
-            continue
-        cfg = exp_data.get("Experiment_Config", {})
-        stats = exp_data.get("Training_Stats", {}).get("VQA-RAD", {})
-        fed_res = exp_data.get("Results", {}).get("Proposed (Fed+RAG)", {})
-        
-        val_c = fed_res.get("VQA-RAD_Validation", {}).get("Closed-Ended", {})
-        val_o = fed_res.get("VQA-RAD_Validation", {}).get("Open-Ended", {})
-        test_c = fed_res.get("VQA-RAD_Test", {}).get("Closed-Ended", {})
-        test_o = fed_res.get("VQA-RAD_Test", {}).get("Open-Ended", {})
-        
-        row = {
-            "Num_Clients": cfg.get("Num_Clients", ""),
-            "Split_Type": cfg.get("Split_Type", ""),
-            "Alpha": cfg.get("Alpha", ""),
-            "Max_Rounds": cfg.get("Max_Rounds_Configured", ""),
-            "Actual_Rounds": stats.get("Actual_Rounds_Run", ""),
-            "Local_Epochs": cfg.get("Local_Epochs", ""),
-            "Final_Avg_Loss": stats.get("Final_Average_Loss", ""),
-            "Training_Time_Sec": stats.get("Training_Time_Seconds", ""),
-            "Val_Closed_Acc": val_c.get("Accuracy", "N/A"),
-            "Val_Closed_F1": val_c.get("F1-Score", "N/A"),
-            "Val_Open_BLEU": val_o.get("BLEU", "N/A"),
-            "Val_Open_ROUGE_L": val_o.get("ROUGE-L", "N/A"),
-            "Test_Closed_Acc": test_c.get("Accuracy", "N/A"),
-            "Test_Closed_F1": test_c.get("F1-Score", "N/A"),
-            "Test_Open_BLEU": test_o.get("BLEU", "N/A"),
-            "Test_Open_ROUGE_L": test_o.get("ROUGE-L", "N/A"),
-            "Inference_Time_Sec": fed_res.get("Inference_Time_Seconds", "")
-        }
-        rows.append(row)
-        
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"\n[CSV Summary] All results aggregated and saved to: {csv_path}")
 
 def main():
-    k_list = [4, 5]
+    k_list = [2, 5]
     num_rounds = 10
     epochs = 1
-    alpha_list = [0.1, 0.5]
+    alpha_list = [0.5]
     question_type = "all"
     max_samples = None
     split_type = "non-iid"
+    csv_path = "./data/summary_results_clients_textonly_VQA-RAD_0.5.csv"
 
     for k in k_list:
-        json_path = f"./data/eval_results_{k}_clients_textonly_VQA-RAD.json"
-        csv_path = f"./data/summary_results_clients_textonly_VQA-RAD.csv"
-        results_dict = {}
-        if os.path.exists(json_path):
-            try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    results_dict = json.load(f)
-                print(f"[LOAD] Loaded existing results from {json_path}")
-                save_summary_csv(results_dict, csv_path)
-            except Exception as e:
-                print(f"[WARN] Failed to load existing json: {e}")
         for alpha in alpha_list:
             print("\n" + "="*80)
             print(f"   STARTING EXPERIMENT LOOP: K = {k} CLIENTS | SPLIT = {split_type.upper()} | ALPHA = {alpha}")
             print("="*80)
-            results_dict = run_federated_simulation(
+            run_federated_simulation(
                 num_clients=k,
                 num_rounds=num_rounds,
                 epochs=epochs,
@@ -802,9 +798,8 @@ def main():
                 alpha=alpha,
                 question_type=question_type,
                 max_samples=max_samples,
-                results_dict=results_dict
+                csv_path=csv_path
             )
-            save_summary_csv(results_dict, csv_path)
 
 if __name__ == "__main__":
     main()
